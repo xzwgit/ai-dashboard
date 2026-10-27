@@ -1520,6 +1520,7 @@ class Handler(BaseHTTPRequestHandler):
                           "prompt_tokens_total", "preemptions", "finished"):
                     row[k] = nb.get(k)
                 row["node"] = getattr(t, "node", None)
+                row["context_len"] = getattr(t, "context_len", "")
                 rows.append(row)
             tot["tpot_p95"] = (sum(tpots) / len(tpots)) if tpots else None
             gw = None
@@ -1740,7 +1741,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
   background-image:linear-gradient(rgba(130,160,255,.05) 1px,transparent 1px),
     linear-gradient(90deg,rgba(130,160,255,.05) 1px,transparent 1px);
   background-size:44px 44px;}
-.wrap{max-width:1780px;margin:0 auto;padding:14px 18px 26px;position:relative}
+.wrap{max-width:1780px;margin:0;padding:12px 14px 26px;position:relative}
 
 /* ---- header（标题独占居中行，其余下移工具栏） ---- */
 .brand{display:flex;justify-content:center;padding:2px 0 10px}
@@ -1770,6 +1771,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .ovtbl{width:100%;border-collapse:collapse;font-size:12px}
 .ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 8px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px}
 .ovtbl td{padding:2px 8px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35}
+.ovtbl td:last-child{min-width:238px}
 .ovtbl tr.ovrow{cursor:pointer}
 .ovtbl tr.ovrow:hover{background:rgba(34,211,238,.06)}
 .ovtbl td.nm{color:#cfe3ff;font-weight:600}
@@ -2388,7 +2390,7 @@ function renderOverview(ov){
       <div class="ln">内存 ${mem} · ${esc(n.os_pretty||"")}</div>
       <div class="ln dim">已运行 ${fmtUp(n.uptime_s)}${n.ip?" · IP "+esc(n.ip):""}</div>`
       :`<div class="ln dim">宿主机信息未接入（在该机 :8124 跑一个同款大屏实例即自动接入 CPU/GPU/内存）</div>`}
-      <div class="ln dim">${esc(r.model||"—")}${r.version?" · vLLM "+esc(r.version):""}</div>
+      <div class="ln dim">${esc(r.model||"—")}${r.context_len?" · "+fmtCtx(r.context_len)+" ctx":""}${r.version?" · vLLM "+esc(r.version):""}</div>
     </div>`;}).join("")||`<div class="dim" style="padding:10px">暂无监控目标（⚙ → ＋ 添加监控目标）</div>`;
   $("ovNodes").onclick=e=>{
     const nd=e.target.closest(".ovnode");if(!nd)return;
@@ -2403,7 +2405,7 @@ function renderOverview(ov){
       <td>${fmtInt(r.running)} / ${fmtInt(r.waiting)}</td>
       <td>${kv}</td><td>${r.tpot_p95==null?"—":fmtMs(r.tpot_p95)}</td>
       <td>${fmtTok(r.gen_tokens_total)}</td>
-      <td class="mono" style="color:var(--dim)">${esc(r.model||"—")}${r.version?" · "+esc(r.version):""}</td>
+      <td class="mono" style="color:var(--dim)" title="${esc((r.model||"—")+(r.context_len?" · ctx "+esc(r.context_len):"")+(r.version?" · vLLM "+esc(r.version):""))}">${esc(r.model||"—")}${r.context_len?" · "+fmtCtx(r.context_len)+" ctx":""}${r.version?" · vLLM "+esc(r.version):""}</td>
     </tr>`;}).join("");
   tb.onclick=e=>{
     const tr=e.target.closest("tr.ovrow");if(!tr)return;
@@ -2466,6 +2468,7 @@ function render(){
 }
 function fmtUp(s){if(s==null)return"—";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return (d?d+" 天 ":"")+(d||h?h+" 小时 ":"")+m+" 分";}
+function fmtCtx(s){const v=parseInt(s);if(!v)return"";return v%1048576===0?(v/1048576)+"M":v%1024===0?(v/1024)+"K":String(v);}
 function uptimeStr(ts){const s=Math.max(0,Date.now()/1000-ts);const m=Math.floor(s/60);
   return m>=60?Math.floor(m/60)+" 小时 "+(m%60)+" 分":m+" 分 "+Math.floor(s%60)+" 秒";}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
