@@ -1,0 +1,1623 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""vLLM 推理监控大屏 —— 单文件、纯标准库、Prometheus /metrics 抓取 + 现代化 Web 大屏。
+
+定位：替代 Prometheus+Grafana 看板里最常用的 vLLM 应用层指标（decode 速度 / KV cache 容量 /
+并发 / TTFT / TPOT / 投机解码接受率 / 前缀缓存命中 / 抢占），界面为中文大屏风格。
+
+用法:
+  # 监控一个 vLLM 服务（服务端口即 OpenAI 端口，/metrics 自动拼接）:
+  python vllm_dashboard.py --target my-vllm=http://127.0.0.1:8123 --api-key sk-xxxx
+  # 多目标 + 指定端口:
+  python vllm_dashboard.py --port 8124 --target a=http://10.0.0.1:8123 --target b=http://10.0.0.2:8123
+  # 无服务时先看界面效果（内置仿真数据源）:
+  python vllm_dashboard.py --demo
+
+  目标也可在页面里随时增删（存 targets.json，与 --target 共存合并）。
+
+指标口径:
+  - 生成/预填充吞吐 = 计数器差分（trailing ~12s 窗口）
+  - TTFT/TPOT/E2E/排队延迟分位 = 直方图 bucket 差分（trailing ~30s 窗口，仅统计新完成请求）
+  - 投机接受率 = Δaccepted/Δdraft（窗口）；前缀缓存命中 = Δhits/Δqueries
+  - 兼容 vLLM 新旧指标名（token_generation_tokens_total/generation_tokens_total、
+    e2e_request_latency_seconds/request_latency_seconds、request_queue_time_seconds/time_in_queue_requests）
+
+依赖: Python 3.8+ 标准库；远程机/本地机均可运行。
+"""
+import argparse
+import base64
+import json
+import math
+import os
+import random
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ============================== 配置 ==============================
+
+VERSION = "1.0.0"    # v1 定版（2026-10-26）：监控大屏基础功能
+
+W_RATE = 12.0        # 吞吐差分窗口（秒）
+W_PCT = 30.0         # 延迟分位窗口（秒）
+DEFAULT_INTERVAL = 2.0
+DEFAULT_HISTORY = 5400  # 每目标最多保留点数（2s 间隔 ≈ 3 小时）
+
+# 计数器/仪表别名（新名在前，旧名在后，命中哪个用哪个）
+ALIAS = {
+    "gen_tokens": ["vllm:token_generation_tokens_total", "vllm:generation_tokens_total"],
+    "prompt_tokens": ["vllm:prompt_tokens_total"],
+    "running": ["vllm:num_requests_running"],
+    "waiting": ["vllm:num_requests_waiting"],
+    "swapped": ["vllm:num_requests_swapped"],
+    "kv_perc": ["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"],
+    "kv_used_tokens": ["vllm:kv_cache_usage_num_tokens", "vllm:gpu_cache_usage_num_tokens"],
+    "kv_max_tokens": ["vllm:kv_cache_max_num_tokens", "vllm:gpu_cache_max_num_tokens"],
+    "preemptions": ["vllm:num_preemptions_total"],
+    "spec_accepted": ["vllm:spec_decode_num_accepted_tokens_total"],
+    "spec_draft": ["vllm:spec_decode_num_draft_tokens_total"],
+    "pc_queries": ["vllm:prefix_cache_queries_total"],
+    "pc_hits": ["vllm:prefix_cache_hits_total"],
+}
+# 直方图别名
+ALIAS_HIST = {
+    "ttft": ["vllm:time_to_first_token_seconds"],
+    "tpot": ["vllm:request_time_per_output_token_seconds", "vllm:time_per_output_token_seconds"],
+    "e2e": ["vllm:e2e_request_latency_seconds", "vllm:request_latency_seconds"],
+    "queue": ["vllm:request_queue_time_seconds", "vllm:time_in_queue_requests"],
+}
+
+SERIES_KEYS = [
+    "gen_rate", "prompt_rate", "running", "waiting", "kv_perc",
+    "ttft_p50", "ttft_p95", "tpot_p50", "tpot_p95", "e2e_p95", "queue_p95",
+    "spec_accept", "prefix_hit",
+]
+
+# ============================== Prometheus 文本解析 ==============================
+
+_RE_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{(.*)\})?\s+([^\s]+)\s*$')
+_RE_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+
+def _parse_value(s):
+    if s in ("+Inf", "Inf"):
+        return math.inf
+    if s == "-Inf":
+        return -math.inf
+    if s == "NaN":
+        return math.nan
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _unesc(v):
+    return v.replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
+
+
+def parse_prom_text(text):
+    """解析 Prometheus exposition 文本 → (simple{name:val}, labeled{(name,labelvals):val}, hist{prefix:{buckets,sum,count}})"""
+    simple, labeled, hist = {}, {}, {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _RE_LINE.match(line)
+        if not m:
+            continue
+        name, _, lbl_src, val_src = m.group(1), m.group(2), m.group(3), m.group(4)
+        val = _parse_value(val_src)
+        if val is None:
+            continue
+        labels = {}
+        if lbl_src:
+            for k, v in _RE_LABEL.findall(lbl_src):
+                labels[k] = _unesc(v)
+        if name.endswith("_bucket") and "le" in labels:
+            le = _parse_value(labels["le"])
+            if le is None:
+                continue
+            h = hist.setdefault(name[:-7], {"buckets": [], "sum": 0.0, "count": 0.0})
+            h["buckets"].append((le, val))
+        elif name.endswith("_sum") or name.endswith("_count"):
+            base = name[:-4] if name.endswith("_sum") else name[:-6]
+            h = hist.setdefault(base, {"buckets": [], "sum": 0.0, "count": 0.0})
+            if name.endswith("_sum"):
+                h["sum"] = val
+            else:
+                h["count"] = val
+        elif labels:
+            labeled[(name, tuple(sorted(labels.items())))] = val
+        else:
+            simple[name] = val
+    for h in hist.values():
+        h["buckets"].sort(key=lambda x: x[0])
+    return simple, labeled, hist
+
+
+def hist_quantile(buckets, q):
+    """Prometheus histogram_quantile 插值。buckets=[(le,cum)...] 已按 le 升序。"""
+    if not buckets:
+        return None
+    total = buckets[-1][1]
+    if total <= 0:
+        return None
+    rank = q * total
+    prev_le, prev_cum = 0.0, 0.0
+    for le, cum in buckets:
+        if cum >= rank:
+            if cum <= prev_cum:
+                return le
+            frac = (rank - prev_cum) / (cum - prev_cum)
+            if math.isinf(le):
+                return prev_le
+            qv = prev_le + (le - prev_le) * frac
+            return qv if math.isfinite(qv) else None
+        prev_le, prev_cum = le, cum
+    return buckets[-1][0]
+
+
+def hist_delta(b_now, b_ref):
+    """两份累计 bucket 快照差分 → 窗口直方图。"""
+    if not b_now:
+        return None
+    if not b_ref:
+        return b_now
+    ref_map = {le: c for le, c in b_ref}
+    out = []
+    for le, c in b_now:
+        out.append((le, max(0.0, c - ref_map.get(le, c))))
+    return out
+
+
+# ============================== 目标与抓取 ==============================
+
+class Target:
+    _seq = 0
+
+    def __init__(self, name, url, api_key="", interval=DEFAULT_INTERVAL, hist_max=DEFAULT_HISTORY,
+                 model_path="", context_len=""):
+        Target._seq += 1
+        self.id = "t%d_%s" % (Target._seq, base64.b16encode(os.urandom(3)).decode().lower())
+        self.name = name
+        self.url = url.rstrip("/")
+        self.api_key = api_key
+        self.model_path = model_path
+        self.context_len = str(context_len or "")
+        self.meta_info = {}       # 自动抓取: version / model_ids
+        self.interval = interval
+        self.hist_max = hist_max
+        self.status = "init"     # init/up/down
+        self.last_error = None
+        self.last_ts = 0.0
+        self.monitor_since = time.time()
+        self.n_scrapes = 0
+        # 原始点（供差分）与派生序列
+        self._t = []            # 每次抓取的 ts
+        self._raw = []          # [{gauge/counter 快照}, ...]（别名解析后）
+        self._hist = []         # [{prefix: {"buckets":..., "sum":.., "count":..}}, ...]
+        self.series = {k: [] for k in SERIES_KEYS}
+        self._finished = {}
+        self.has_spec = False
+        self.has_prefix_cache = False
+        self.kv_max_tokens = 0
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    # ---------- 抓取 ----------
+    def metrics_url(self):
+        u = self.url
+        from urllib.parse import urlparse
+        path = urlparse(u).path
+        if path in ("", "/"):
+            return u.rstrip("/") + "/metrics"
+        return u  # 已带路径（如 /api/demo-metrics 或完整 /metrics 地址）则不拼
+
+    def _scrape(self):
+        req = urllib.request.Request(self.metrics_url())
+        if self.api_key:
+            req.add_header("Authorization", "Bearer " + self.api_key)
+        with urllib.request.urlopen(req, timeout=min(8.0, self.interval * 3 + 2)) as r:
+            return r.read().decode("utf-8", "replace")
+
+    def _loop(self):
+        while not self._stop.wait(self.interval):
+            try:
+                text = self._scrape()
+                simple, labeled, hist = parse_prom_text(text)
+                self._ingest(simple, labeled, hist)
+                self.status = "up"
+                self.last_error = None
+            except Exception as e:
+                self.status = "down"
+                self.last_error = self._friendly_error(e)
+            if self.n_scrapes % 30 == 1:      # 模型元数据 ~60s 刷新一次
+                threading.Thread(target=self._fetch_meta, daemon=True).start()
+
+    @staticmethod
+    def _friendly_error(e):
+        """把抓取异常翻译成人话+排查建议，附原始错误短摘要。"""
+        raw = ("%s: %s" % (type(e).__name__, e))[:110]
+        try:
+            if isinstance(e, urllib.error.HTTPError):
+                c = e.code
+                if c in (401, 403):
+                    return "鉴权失败(HTTP %d)：/metrics 需要 API Key 或 Key 错误——⚙ 添加目标时填上 Key（原始: %s）" % (c, raw)
+                if c == 404:
+                    return "路径不存在(HTTP 404)：该地址没有 /metrics——确认填的是 vLLM 服务端口（原始: %s）" % raw
+                return "HTTP %d（原始: %s）" % (c, raw)
+            if isinstance(e, urllib.error.URLError):
+                r = str(e.reason)
+                if ("refused" in r or "Errno 111" in r or "10061" in r
+                        or "积极拒绝" in r or "No connection could be made" in r):
+                    return "连接被拒：vLLM 服务未启动或已退出，或端口不对（原始: %s）" % raw
+                if "timed out" in r or "timeout" in r.lower():
+                    return "连接超时：IP/端口错误或网络不通（原始: %s）" % raw
+                if "getaddrinfo" in r or "Name or service" in r:
+                    return "域名解析失败：主机名写错了（原始: %s）" % raw
+                return "URL 错误：%s（原始: %s）" % (r, raw)
+        except Exception:
+            pass
+        return raw
+
+    def _fetch_meta(self):
+        meta = {}
+        try:
+            req = urllib.request.Request(self.url + "/version")
+            if self.api_key:
+                req.add_header("Authorization", "Bearer " + self.api_key)
+            with urllib.request.urlopen(req, timeout=4) as r:
+                meta["version"] = r.read().decode("utf-8", "replace").strip()[:60]
+        except Exception:
+            pass
+        try:
+            req = urllib.request.Request(self.url + "/v1/models")
+            if self.api_key:
+                req.add_header("Authorization", "Bearer " + self.api_key)
+            with urllib.request.urlopen(req, timeout=4) as r:
+                j = json.loads(r.read().decode("utf-8", "replace"))
+                meta["model_ids"] = [m.get("id") for m in j.get("data", []) if m.get("id")][:4]
+        except Exception:
+            pass
+        if meta:
+            self.meta_info = meta
+
+    # ---------- 摄入与派生 ----------
+    @staticmethod
+    def _pick(simple, names):
+        for n in names:
+            if n in simple:
+                return simple[n]
+        return None
+
+    def _ingest(self, simple, labeled, hist):
+        now = time.time()
+        # finish_reason 计数
+        finished = {}
+        for (name, lk), v in labeled.items():
+            if name.endswith("request_success_total") or name.endswith("request_failure_total"):
+                d = dict(lk)
+                key = d.get("finish_reason") or d.get("error_type") or "other"
+                finished[key] = finished.get(key, 0.0) + v
+        # 带标签同名 gauge/counter（如 model_name）求和
+        agg = dict(simple)
+        for (name, lk), v in labeled.items():
+            if name.endswith("request_success_total"):
+                continue
+            agg[name] = agg.get(name, 0.0) + v
+        snap = {}
+        for key, names in ALIAS.items():
+            v = self._pick(agg, names)
+            if v is not None and not math.isfinite(v):
+                v = None
+            snap[key] = v
+        hsnap = {}
+        for key, names in ALIAS_HIST.items():
+            for n in names:
+                if n in hist:
+                    hsnap[key] = hist[n]
+                    break
+        self._finished = finished
+        if snap.get("spec_accepted") is not None:
+            self.has_spec = True
+        if snap.get("pc_queries") is not None:
+            self.has_prefix_cache = True
+        if snap.get("kv_max_tokens"):
+            self.kv_max_tokens = int(snap["kv_max_tokens"])
+
+        with self.lock:
+            self._t.append(now)
+            self._raw.append(snap)
+            self._hist.append(hsnap)
+            self.n_scrapes += 1
+            self._derive_latest(now)
+            # 裁剪
+            if len(self._t) > self.hist_max:
+                cut = len(self._t) - self.hist_max
+                del self._t[:cut]
+                del self._raw[:cut]
+                del self._hist[:cut]
+                for k in SERIES_KEYS:
+                    del self.series[k][:cut]
+
+    def _idx_before(self, now, window):
+        """返回不早于 now-window 的最旧点下标；不足窗口时用最旧可用点。"""
+        lo = now - window
+        for i, t in enumerate(self._t):
+            if t >= lo:
+                return i
+        return 0
+
+    @staticmethod
+    def _rate(t0, t1, v0, v1):
+        if v0 is None or v1 is None:
+            return None
+        if t1 - t0 < 1e-6:
+            return None
+        d = v1 - v0
+        if d < 0:            # 计数器重启
+            return None
+        r = d / (t1 - t0)
+        return r if math.isfinite(r) else None
+
+    def _derive_latest(self, now):
+        i = len(self._t) - 1
+        t = self._t
+        j_rate = self._idx_before(now, W_RATE)
+        j_pct = self._idx_before(now, W_PCT)
+        raw, hist = self._raw, self._hist
+        cur = raw[i]
+        s = {k: None for k in SERIES_KEYS}
+        s["running"] = cur.get("running")
+        s["waiting"] = cur.get("waiting")
+        s["kv_perc"] = cur.get("kv_perc")
+        s["gen_rate"] = self._rate(t[j_rate], t[i], raw[j_rate].get("gen_tokens"), cur.get("gen_tokens"))
+        s["prompt_rate"] = self._rate(t[j_rate], t[i], raw[j_rate].get("prompt_tokens"), cur.get("prompt_tokens"))
+        for key, p50_key, p95_key in (("ttft", "ttft_p50", "ttft_p95"),
+                                      ("tpot", "tpot_p50", "tpot_p95")):
+            h_now = hist[i].get(key)
+            h_ref = hist[j_pct].get(key) if j_pct < len(hist) else None
+            if h_now:
+                delta = hist_delta(h_now["buckets"], h_ref["buckets"] if h_ref else None)
+                s[p50_key] = hist_quantile(delta, 0.50)
+                s[p95_key] = hist_quantile(delta, 0.95)
+        for key, out in (("e2e", "e2e_p95"), ("queue", "queue_p95")):
+            h_now = hist[i].get(key)
+            h_ref = hist[j_pct].get(key) if j_pct < len(hist) else None
+            if h_now:
+                delta = hist_delta(h_now["buckets"], h_ref["buckets"] if h_ref else None)
+                s[out] = hist_quantile(delta, 0.95)
+        acc = self._rate(t[j_pct], t[i], raw[j_pct].get("spec_accepted"), cur.get("spec_accepted"))
+        drf = self._rate(t[j_pct], t[i], raw[j_pct].get("spec_draft"), cur.get("spec_draft"))
+        if acc is not None and drf is not None and drf > 0:
+            s["spec_accept"] = min(1.0, acc / drf)
+        hq = self._rate(t[j_pct], t[i], raw[j_pct].get("pc_hits"), cur.get("pc_hits"))
+        qq = self._rate(t[j_pct], t[i], raw[j_pct].get("pc_queries"), cur.get("pc_queries"))
+        if hq is not None and qq is not None and qq > 0:
+            s["prefix_hit"] = min(1.0, hq / qq)
+        for k, v in s.items():
+            self.series[k].append(v)
+        self.last_ts = t[i]
+
+    # ---------- 输出 ----------
+    def snapshot(self, maxpoints=1200):
+        with self.lock:
+            n = len(self._t)
+            stride = max(1, math.ceil(n / maxpoints))
+            sl = slice(0, n, stride)
+            series = {}
+            t = list(self._t)[sl]
+            for k in SERIES_KEYS:
+                col = self.series[k]
+                series[k] = [col[i] for i in range(0, n, stride)]
+            cur = dict(self._raw[-1]) if self._raw else {}
+            fin = dict(self._finished)
+            payload = {
+                "id": self.id, "name": self.name, "url": self.url,
+                "status": self.status, "last_error": self.last_error,
+                "last_ts": self.last_ts, "interval": self.interval,
+                "monitor_since": self.monitor_since, "n_scrapes": self.n_scrapes,
+                "has_spec": self.has_spec, "has_prefix_cache": self.has_prefix_cache,
+                "kv_max_tokens": self.kv_max_tokens,
+                "model_path": self.model_path, "context_len": self.context_len,
+                "api_key": self.api_key, "meta_info": self.meta_info,
+                "meta": {"points": n, "stride": stride},
+                "series": {"t": t, **series},
+            }
+            # KPI 当前值
+            def last(k):
+                col = self.series[k]
+                for v in reversed(col):
+                    if v is not None:
+                        return v
+                return None
+            payload["now"] = {
+                "running": cur.get("running"), "waiting": cur.get("waiting"),
+                "swapped": cur.get("swapped"),
+                "gen_rate": last("gen_rate"), "prompt_rate": last("prompt_rate"),
+                "kv_perc": cur.get("kv_perc"),
+                "kv_used_tokens": cur.get("kv_used_tokens"),
+                "ttft_p50": last("ttft_p50"), "ttft_p95": last("ttft_p95"),
+                "tpot_p50": last("tpot_p50"), "tpot_p95": last("tpot_p95"),
+                "e2e_p95": last("e2e_p95"), "queue_p95": last("queue_p95"),
+                "spec_accept": last("spec_accept"), "prefix_hit": last("prefix_hit"),
+                "preemptions": cur.get("preemptions"),
+                "gen_tokens_total": cur.get("gen_tokens"),
+                "prompt_tokens_total": cur.get("prompt_tokens"),
+                "_fin_total": sum(fin.values()) or None,
+                "_fin_stop": fin.get("stop"),
+                "_fin_len": fin.get("length"),
+            }
+            return payload
+
+
+# ============================== 宿主机资源采集（CPU/内存/GPU） ==============================
+
+class NodeCollector:
+    """采集大屏所在宿主机（部署在引擎机上=引擎宿主机）的 CPU/内存/GPU 实时使用率。
+    Linux 读 /proc，GPU 走 nvidia-smi；缺失的源显示为不可用。"""
+
+    def __init__(self, interval=3.0, hist_max=1200):
+        import platform as _plat
+        self.interval = interval
+        self.hist_max = hist_max
+        self.hostname = _plat.node() or socket.gethostname()
+        self.platform = _plat.platform(terse=True)
+        self.os_pretty = self._os_pretty() or self.platform
+        self.kernel = "%s (%s)" % (_plat.release(), _plat.machine())
+        self.cpu_name, self.cpu_cores = self._cpu_model()
+        self.ip = self._outbound_ip()
+        self.has_proc = os.path.exists("/proc/stat")
+        self.has_gpu = self._gpu_ok()
+        self.series = {"t": [], "cpu": [], "mem_perc": [], "gpu_util": [], "gpu_mem_perc": []}
+        self.per_gpu = []
+        self._cpu_prev = None
+        self._stop = threading.Event()
+        if self.has_proc or self.has_gpu:
+            self._prime()
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    @property
+    def available(self):
+        return self.has_proc or self.has_gpu
+
+    def _cpu_model(self):
+        name, cores = "", 0
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name") and not name:
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("processor"):
+                        cores += 1
+        except Exception:
+            pass
+        return (name.replace("(R)", "").replace("(TM)", "").replace("  ", " "), cores)
+
+    def _os_pretty(self):
+        try:
+            with open("/etc/os-release") as f:
+                for line in f:
+                    if line.startswith("PRETTY_NAME="):
+                        return line.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return ""
+
+    def _outbound_ip(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                return "127.0.0.1"
+        finally:
+            s.close()
+
+    def _gpu_ok(self):
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                               capture_output=True, text=True, timeout=5)
+            line = (r.stdout or "").strip().splitlines()
+            self.gpu_name = line[0].strip() if line else ""
+            return True
+        except Exception:
+            self.gpu_name = ""
+            return False
+
+    def _uptime(self):
+        try:
+            with open("/proc/uptime") as f:
+                return float(f.read().split()[0])
+        except Exception:
+            return None
+
+    def _cpu_snap(self):
+        with open("/proc/stat") as f:
+            vals = [float(x) for x in f.readline().split()[1:]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return sum(vals), idle
+
+    def _mem(self):
+        GB = 1024.0 ** 3
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = float(v.strip().split()[0]) * 1024.0
+        total = info.get("MemTotal", 0.0)
+        avail = info.get("MemAvailable", total)
+        return total / GB, max(0.0, total - avail) / GB
+
+    def _gpus(self):
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
+        gpus = []
+        for ln in (r.stdout or "").strip().splitlines():
+            p = [x.strip() for x in ln.split(",")]
+            if len(p) == 4:
+                try:
+                    gpus.append({"i": p[0], "util": float(p[1]),
+                                 "mem_used": float(p[2]) / 1024.0, "mem_total": float(p[3]) / 1024.0})
+                except ValueError:
+                    pass
+        return gpus
+
+    def _prime(self):
+        if self.has_proc:
+            self._cpu_prev = self._cpu_snap()
+        if self.has_gpu:
+            self.per_gpu = self._gpus()
+
+    def _sample(self):
+        now = time.time()
+        cpu = mem_perc = None
+        mem_used = mem_total = 0.0
+        if self.has_proc:
+            total, idle = self._cpu_snap()
+            if self._cpu_prev:
+                dt = total - self._cpu_prev[0]
+                di = idle - self._cpu_prev[1]
+                if dt > 0:
+                    cpu = max(0.0, min(100.0, (dt - di) / dt * 100.0))
+            self._cpu_prev = (total, idle)
+            mem_total, mem_used = self._mem()
+            if mem_total > 0:
+                mem_perc = mem_used / mem_total * 100.0
+        gpu_util = gpu_mem_perc = None
+        if self.has_gpu:
+            self.per_gpu = self._gpus()
+            if self.per_gpu:
+                gpu_util = sum(g["util"] for g in self.per_gpu) / len(self.per_gpu)
+                mu = sum(g["mem_used"] for g in self.per_gpu)
+                mt = sum(g["mem_total"] for g in self.per_gpu)
+                gpu_mem_perc = mu / mt * 100.0 if mt > 0 else None
+                self._last_gpu_mem = (mu, mt)
+        with _NODE_LOCK:
+            for k, v in (("cpu", cpu), ("mem_perc", mem_perc),
+                         ("gpu_util", gpu_util), ("gpu_mem_perc", gpu_mem_perc)):
+                self.series[k].append(v)
+            self.series["t"].append(now)
+            for k in self.series:
+                if len(self.series[k]) > self.hist_max:
+                    del self.series[k][:len(self.series[k]) - self.hist_max]
+            self._last = {"cpu": cpu, "mem_perc": mem_perc, "mem_used": mem_used,
+                          "mem_total": mem_total, "gpu_util": gpu_util,
+                          "gpu_mem_perc": gpu_mem_perc,
+                          "gpu_mem_used": getattr(self, "_last_gpu_mem", (0, 0))[0],
+                          "gpu_mem_total": getattr(self, "_last_gpu_mem", (0, 0))[1]}
+
+    def _loop(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self._sample()
+            except Exception:
+                pass
+
+    def snapshot(self):
+        s = {k: list(v)[-600:] for k, v in self.series.items()}
+        return {"available": self.available, "hostname": self.hostname, "ip": self.ip,
+                "platform": self.platform, "os_pretty": getattr(self, "os_pretty", ""),
+                "kernel": getattr(self, "kernel", ""),
+                "cpu_name": getattr(self, "cpu_name", ""),
+                "cpu_cores": getattr(self, "cpu_cores", 0), "time": time.time(),
+                "has_proc": self.has_proc, "has_gpu": self.has_gpu,
+                "gpu_name": getattr(self, "gpu_name", ""), "uptime_s": self._uptime(),
+                "now": getattr(self, "_last", {}), "per_gpu": self.per_gpu,
+                "series": s}
+
+
+_NODE_LOCK = threading.Lock()
+
+
+# ============================== 目标注册表（持久化） ==============================
+
+class Registry:
+    def __init__(self, path):
+        self.path = path
+        self.targets = []
+        self.lock = threading.Lock()
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for it in json.load(f).get("targets", []):
+                        self._add(it["name"], it["url"], it.get("api_key", ""), start=True,
+                                  model_path=it.get("model_path", ""), context_len=it.get("context_len", ""))
+            except Exception:
+                pass
+
+    def _add(self, name, url, api_key="", start=True, transient=False, model_path="", context_len=""):
+        t = Target(name, url, api_key, model_path=model_path, context_len=context_len)
+        t.transient = transient
+        if start:
+            t.thread.start()
+        with self.lock:
+            self.targets.append(t)
+        return t
+
+    def add(self, name, url, api_key="", transient=False, model_path="", context_len=""):
+        t = self._add(name, url, api_key, transient=transient,
+                      model_path=model_path, context_len=context_len)
+        self.save()
+        return t
+
+    def remove(self, tid):
+        with self.lock:
+            keep = []
+            for t in self.targets:
+                if t.id == tid:
+                    t._stop.set()
+                else:
+                    keep.append(t)
+            self.targets = keep
+        self.save()
+
+    def get(self, tid):
+        for t in self.targets:
+            if t.id == tid:
+                return t
+        return None
+
+    def save(self):
+        if not self.path:
+            return
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"targets": [{"name": t.name, "url": t.url, "api_key": t.api_key,
+                                        "model_path": t.model_path, "context_len": t.context_len}
+                                       for t in self.targets if not getattr(t, "transient", False)]},
+                          f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+
+
+# ============================== 内置演示数据源（--demo） ==============================
+
+class DemoEngine:
+    """仿真 vLLM /metrics：周期性压测负载（空闲→爬坡→c32 满载→排空），数值口径贴近 96G PRO6000 实测。"""
+
+    EDGES = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60]
+
+    def __init__(self):
+        self.t0 = time.time()
+        self.last = self.t0
+        self.reqs = []          # [ctx_in, gen, out_target, speed, done]
+        self.backlog = 0
+        self.gen_total = 0.0
+        self.prompt_total = 0.0
+        self.fin = {"stop": 0, "length": 0}
+        self.pc_q, self.pc_h = 0.0, 0.0
+        self.draft_total, self.acc_total = 0.0, 0.0
+        self.preempt = 0.0
+        self.ttft_s, self.tpot_s, self.e2e_s, self.q_s = [], [], [], []
+        self.kv_used, self.kv_max = 20000, 2_600_000
+        self._advance(time.time(), force=True)
+
+    def _phase(self, el):
+        c = el % 150.0
+        if c < 12:
+            return ("idle", 0.0)
+        if c < 25:
+            return ("ramp", (c - 12) / 13.0)
+        if c < 105:
+            return ("load", 1.0)
+        return ("drain", 0.0)
+
+    def _advance(self, now, force=False):
+        dt = min(10.0, now - self.last) if not force else 0.0
+        if dt <= 0:
+            return
+        self.last = now
+        el = now - self.t0
+        ph, k = self._phase(el)
+        # 新请求到达（1K/4K/16K 混合输入）
+        arr_rate = 0.0
+        if ph == "ramp":
+            arr_rate = 8.0 * k
+        elif ph == "load":
+            arr_rate = 0.3
+        arrivals = max(0, int(random.gauss(arr_rate * dt, 1.2)))
+        for _ in range(arrivals):
+            r = random.random()
+            ctx = 1024 if r < 0.6 else (4096 if r < 0.9 else 16384)
+            self.backlog += 1
+            self.prompt_total += ctx
+            self.pc_q += 1
+            if random.random() < 0.45:
+                self.pc_h += 1
+            ttft = random.lognormvariate(math.log(0.035 + 0.004 * self.backlog), 0.4)
+            self.ttft_s.append((now, ttft))
+            self.q_s.append((now, max(0.0, random.gauss(0.002 + 0.02 * self.backlog, 0.004))))
+        # 调度
+        while self.backlog > 0 and len(self.reqs) < 32:
+            ctx = random.choice([1024] * 6 + [4096] * 3 + [16384])
+            self.reqs.append([ctx, 0, random.randint(700, 1200) if ctx == 1024 else random.randint(600, 1500), 0, now])
+            self.backlog -= 1
+        n = len(self.reqs)
+        # 单流解码速度：c1 ~90 tok/s → c32 ~27 tok/s
+        base = 90.0 if n <= 2 else max(26.0, 90.0 - (n - 2) * (90.0 - 26.0) / 30.0)
+        gen_dt = 0.0
+        for r in self.reqs:
+            if r[3] == 0:
+                r[3] = max(8.0, random.gauss(base, base * 0.12))
+            g = r[3] * dt
+            r[1] += g
+            gen_dt += g
+            self.tpot_s.append((now, 1.0 / r[3]))
+        self.gen_total += gen_dt
+        # 投机解码 k=4，接受率 ~0.55
+        steps = gen_dt / 3.2
+        self.draft_total += steps * 4.0
+        self.acc_total += steps * 4.0 * max(0.3, min(0.95, random.gauss(0.55, 0.05)))
+        # 完成
+        done = [r for r in self.reqs if r[1] >= r[2]]
+        for r in done:
+            self.fin["length" if random.random() < 0.8 else "stop"] += 1
+            self.e2e_s.append((now, now - r[4]))
+        if done:
+            self.reqs = [r for r in self.reqs if r[1] < r[2]]
+        # KV
+        KV_MAX = 2_600_000
+        used = sum(r[0] + r[1] for r in self.reqs) + 20000 * self.backlog
+        if used > KV_MAX * 0.95:
+            self.preempt += 1
+            if self.reqs:
+                self.reqs.pop(random.randrange(len(self.reqs)))
+        self.kv_used, self.kv_max = used, KV_MAX
+        # 样本裁剪
+        for lst in (self.ttft_s, self.tpot_s, self.e2e_s, self.q_s):
+            if len(lst) > 20000:
+                del lst[: len(lst) - 12000]
+
+    def _hist_lines(self, prefix, samples, now):
+        vals = [v for t, v in samples if now - t <= 600]
+        out = ["# TYPE %s histogram" % prefix]
+        for e in self.EDGES:
+            c = sum(1 for v in vals if v <= e)
+            out.append('%s_bucket{le="%s"} %d' % (prefix, ("+Inf" if math.isinf(e) else str(e)), c))
+        out.append('%s_bucket{le="+Inf"} %d' % (prefix, len(vals)))
+        out.append("%s_sum %f" % (prefix, sum(vals)))
+        out.append("%s_count %d" % (prefix, len(vals)))
+        return out
+
+    def render(self):
+        now = time.time()
+        self._advance(now)
+        n = len(self.reqs)
+        L = ["# HELP vllm:num_requests_running Requests currently running on the GPU.",
+             "# TYPE vllm:num_requests_running gauge",
+             "vllm:num_requests_running %d" % n,
+             "# TYPE vllm:num_requests_waiting gauge",
+             "vllm:num_requests_waiting %d" % self.backlog,
+             "# TYPE vllm:num_requests_swapped gauge",
+             "vllm:num_requests_swapped 0",
+             "# TYPE vllm:kv_cache_usage_perc gauge",
+             'vllm:kv_cache_usage_perc{model_name="demo",engine="0"} %.6f' % (self.kv_used / self.kv_max),
+             "# TYPE vllm:generation_tokens_total counter",
+             "vllm:generation_tokens_total %.0f" % self.gen_total,
+             "# TYPE vllm:prompt_tokens_total counter",
+             "vllm:prompt_tokens_total %.0f" % self.prompt_total,
+             "# TYPE vllm:num_preemptions_total counter",
+             "vllm:num_preemptions_total %.0f" % self.preempt,
+             '# TYPE vllm:request_success_total counter',
+             'vllm:request_success_total{finish_reason="stop"} %.0f' % self.fin["stop"],
+             'vllm:request_success_total{finish_reason="length"} %.0f' % self.fin["length"],
+             "# TYPE vllm:spec_decode_num_accepted_tokens_total counter",
+             "vllm:spec_decode_num_accepted_tokens_total %.0f" % self.acc_total,
+             "# TYPE vllm:spec_decode_num_draft_tokens_total counter",
+             "vllm:spec_decode_num_draft_tokens_total %.0f" % self.draft_total,
+             "# TYPE vllm:prefix_cache_queries_total counter",
+             "vllm:prefix_cache_queries_total %.0f" % self.pc_q,
+             "# TYPE vllm:prefix_cache_hits_total counter",
+             "vllm:prefix_cache_hits_total %.0f" % self.pc_h]
+        L += self._hist_lines("vllm:time_to_first_token_seconds", self.ttft_s, now)
+        L += self._hist_lines("vllm:request_time_per_output_token_seconds", self.tpot_s, now)
+        L += self._hist_lines("vllm:e2e_request_latency_seconds", self.e2e_s, now)
+        L += self._hist_lines("vllm:request_queue_time_seconds", self.q_s, now)
+        return "\n".join(L) + "\n"
+
+
+# ============================== Web 服务 ==============================
+
+HTML = None  # 见文件底部 _build_html()
+
+
+class Handler(BaseHTTPRequestHandler):
+    reg = None       # type: Registry
+    demo = None      # type: DemoEngine
+    node = None      # type: NodeCollector
+    started = time.time()
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            body = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/api/targets":
+            self._json({"targets": [
+                {"id": t.id, "name": t.name, "url": t.url, "status": t.status,
+                 "last_error": t.last_error, "last_ts": t.last_ts}
+                for t in Handler.reg.targets]})
+        elif path == "/api/node":
+            if Handler.node:
+                self._json(Handler.node.snapshot())
+            else:
+                self._json({"available": False})
+        elif path == "/api/data":
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            tid = (q.get("id") or [""])[0]
+            maxp = int((q.get("maxpoints") or ["1200"])[0])
+            t = Handler.reg.get(tid)
+            if not t:
+                self._json({"error": "no such target"}, 404)
+                return
+            self._json(t.snapshot(maxpoints=maxp))
+        elif path == "/api/demo-metrics":
+            if Handler.demo:
+                body = Handler.demo.render().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(404)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+        except Exception:
+            self._json({"error": "bad json"}, 400)
+            return
+        path = self.path.split("?")[0]
+        if path == "/api/targets":
+            name = (payload.get("name") or "").strip() or "target"
+            url = (payload.get("url") or "").strip()
+            if not url:
+                self._json({"error": "url required"}, 400)
+                return
+            if not re.match(r"^https?://", url):
+                self._json({"error": "url must start with http(s)://"}, 400)
+                return
+            t = Handler.reg.add(name, url, payload.get("api_key") or "",
+                                model_path=(payload.get("model_path") or "").strip(),
+                                context_len=(payload.get("context_len") or "").strip())
+            self._json({"ok": True, "id": t.id})
+        elif path == "/api/targets/remove":
+            Handler.reg.remove(payload.get("id") or "")
+            self._json({"ok": True})
+        else:
+            self._json({"error": "not found"}, 404)
+
+
+def main():
+    global HTML
+    ap = argparse.ArgumentParser(description="vLLM 推理监控大屏（单文件，标准库）")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8124)
+    ap.add_argument("--target", action="append", default=[],
+                    help="NAME=URL，可多次；URL 为 vLLM 服务根地址（自动拼 /metrics）")
+    ap.add_argument("--api-key", default="", help="默认抓取用 Bearer key（页面添加的目标可单独覆盖）")
+    ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
+    ap.add_argument("--history", type=int, default=DEFAULT_HISTORY)
+    ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets.json"))
+    ap.add_argument("--demo", action="store_true", help="内置仿真数据源（无真实服务时演示界面）")
+    ap.add_argument("--no-open", action="store_true")
+    args = ap.parse_args()
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    HTML = _build_html()
+    reg = Registry(args.config)
+    Handler.reg = reg
+    Handler.node = NodeCollector(interval=max(3.0, args.interval + 1.0))
+    if not Handler.node.available:
+        print("[node] 宿主机资源采集不可用（无 /proc 且无 nvidia-smi），服务器资源卡将隐藏")
+
+    demo_url = None
+    if args.demo:
+        Handler.demo = DemoEngine()
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        demo_port = s.getsockname()[1]
+        s.close()
+        # demo 指标挂在主服务的 /api/demo-metrics 上，直接注册为本地回环目标
+        demo_url = "http://127.0.0.1:%d/api/demo-metrics" % args.port
+        reg.add("demo 仿真", demo_url, transient=True)
+        print("[demo] 仿真数据源已启用（周期负载：空闲-爬坡-c32-排空）")
+
+    for spec in args.target:
+        if "=" in spec:
+            name, url = spec.split("=", 1)
+        else:
+            name, url = spec.rsplit("/", 1)[-1] or "target", spec
+        if not any(t.url.rstrip("/") == url.rstrip("/") for t in reg.targets):
+            reg.add(name, url, args.api_key)
+            print("[target] %s = %s" % (name, url))
+    reg.save()
+
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    print("=" * 62)
+    print("  vLLM 推理监控大屏已启动  (v%s)" % VERSION)
+    print("  界面:   http://%s:%d/" % ("127.0.0.1" if args.host == "0.0.0.0" else args.host, args.port))
+    print("  目标数: %d | 抓取间隔 %.0fs | 历史 %d 点/目标" % (len(reg.targets), args.interval, args.history))
+    print("  目标配置持久化: %s" % args.config)
+    print("=" * 62)
+    if not args.no_open:
+        try:
+            import webbrowser
+            threading.Timer(0.6, lambda: webbrowser.open("http://127.0.0.1:%d/" % args.port)).start()
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
+# ============================== 前端（内嵌 HTML） ==============================
+
+def _build_html():
+    return r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM 推理监控大屏</title>
+<style>
+:root{
+  --bg:#070b16; --panel:rgba(20,28,48,.55); --panel-border:rgba(120,160,255,.14);
+  --txt:#dbe6ff; --dim:#7f8db0; --accent:#22d3ee; --blue:#60a5fa; --violet:#a78bfa;
+  --amber:#fbbf24; --rose:#fb7185; --green:#34d399;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
+  background:
+    radial-gradient(1200px 500px at 15% -10%, rgba(34,211,238,.10), transparent 60%),
+    radial-gradient(1000px 600px at 85% -20%, rgba(167,139,250,.10), transparent 60%),
+    var(--bg);
+  color:var(--txt); overflow-x:hidden;
+  font-variant-numeric:tabular-nums;
+}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
+  background-image:linear-gradient(rgba(130,160,255,.05) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(130,160,255,.05) 1px,transparent 1px);
+  background-size:44px 44px;}
+.wrap{max-width:1780px;margin:0 auto;padding:14px 18px 26px;position:relative}
+
+/* ---- header（标题独占居中行，其余下移工具栏） ---- */
+.brand{display:flex;justify-content:center;padding:2px 0 10px}
+.brand h1{font-size:25px;font-weight:700;letter-spacing:3px;text-align:center;
+  background:linear-gradient(92deg,#67e8f9,#818cf8 55%,#c084fc);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:0 2px 12px}
+.toolbar .spacer{flex:1}
+.gearwrap{position:relative}
+#gearBtn{width:34px;height:30px;border-radius:8px;border:1px solid rgba(120,160,255,.35);
+  background:transparent;color:#9fb4e8;cursor:pointer;font-size:15px;line-height:1}
+#gearBtn:hover,#gearBtn.open{color:var(--accent);border-color:rgba(34,211,238,.5)}
+.menu{position:absolute;right:0;top:116%;background:#0d1428;border:1px solid rgba(130,160,255,.3);
+  border-radius:11px;padding:6px;display:none;min-width:186px;z-index:60;
+  box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.menu .mi{padding:9px 12px;border-radius:8px;font-size:13px;color:var(--txt);cursor:pointer;white-space:nowrap}
+.menu .mi:hover{background:rgba(34,211,238,.10);color:#aef3ff}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.tab{padding:7px 14px;border-radius:9px;cursor:pointer;border:1px solid var(--panel-border);
+  background:var(--panel);font-size:13px;display:flex;gap:8px;align-items:center;user-select:none}
+.tab.active{border-color:rgba(34,211,238,.55);background:rgba(34,211,238,.10);color:#aef3ff}
+.tab .x{color:var(--dim);font-size:11px;padding:0 2px;border-radius:4px}
+.tab .x:hover{color:var(--rose)}
+.tab .led{width:8px;height:8px;border-radius:50%;background:#555}
+.tab .led.up{background:var(--green);box-shadow:0 0 8px var(--green)}
+.tab .led.down{background:var(--rose);box-shadow:0 0 8px var(--rose)}
+.spacer{flex:1}
+.clock{font-size:14px;color:#9fb4e8;letter-spacing:.5px}
+.clock small{color:var(--dim);margin-left:8px}
+.ranges{display:flex;gap:6px}
+.ranges button{padding:5px 10px;font-size:12px;border-radius:7px;border:1px solid var(--panel-border);
+  background:transparent;color:var(--dim);cursor:pointer}
+.ranges button.active{color:var(--accent);border-color:rgba(34,211,238,.5);background:rgba(34,211,238,.08)}
+
+/* ---- banner ---- */
+#banner{display:none;margin:4px 0 10px;padding:10px 14px;border-radius:10px;
+  border:1px solid rgba(251,113,133,.4);background:rgba(251,113,133,.08);color:#ffd3da;font-size:13px}
+
+/* ---- KPI ---- */
+/* ---- KPI + 服务器资源两栏区（左：模型卡+vLLM 卡两行 / 右：服务器卡） ---- */
+.zone{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;align-items:stretch}
+.zleft{display:flex;flex-direction:column;gap:10px;flex:2 1 640px;min-width:0}
+.modelcard{padding:9px 14px 7px}
+.modelcard h4{margin-bottom:4px;font-size:12px}
+.modelcard td{padding:2.5px 4px;font-size:12px}
+.kpis{display:grid;grid-template-columns:repeat(6,minmax(130px,158px));grid-auto-rows:1fr;
+  gap:10px;align-content:start;justify-content:start}
+.nodes{display:grid;grid-template-columns:minmax(240px,1fr);gap:12px;
+  flex:1 1 340px;min-width:300px;align-content:start}
+@media (max-width:1280px){.kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));flex:1 1 100%}}
+.kpi{background:var(--panel);border:1px solid var(--panel-border);border-radius:13px;
+  padding:9px 12px 7px;backdrop-filter:blur(8px);position:relative;overflow:hidden;transition:border-color .3s}
+.kpi:hover{border-color:rgba(34,211,238,.4)}
+.kpi .lbl{font-size:11.5px;color:var(--dim);display:flex;justify-content:space-between;align-items:center}
+.kpi .val{font-size:22px;font-weight:700;margin:4px 0 2px;letter-spacing:.5px;line-height:1.1}
+.kpi .unit{font-size:12px;color:var(--dim);font-weight:400;margin-left:3px}
+.kpi .sub{font-size:11px;color:var(--dim);min-height:13px}
+.kpi canvas.spark{position:absolute;right:7px;bottom:7px;width:66px;height:27px;opacity:.9}
+.kpi.hidden{display:none}
+.c-cyan{color:#67e8f9;text-shadow:0 0 18px rgba(34,211,238,.35)}
+.c-blue{color:#93c5fd;text-shadow:0 0 18px rgba(96,165,250,.35)}
+.c-violet{color:#c4b5fd;text-shadow:0 0 18px rgba(167,139,250,.35)}
+.c-amber{color:#fcd34d;text-shadow:0 0 18px rgba(251,191,36,.3)}
+.c-green{color:#6ee7b7;text-shadow:0 0 18px rgba(52,211,153,.3)}
+.c-rose{color:#fda4af;text-shadow:0 0 18px rgba(251,113,133,.3)}
+.bar{height:6px;border-radius:3px;background:rgba(130,160,255,.12);margin:7px 0 4px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,#34d399,#22d3ee);
+  transition:width .5s ease}
+.bar i.warn{background:linear-gradient(90deg,#fbbf24,#f97316)}
+.bar i.crit{background:linear-gradient(90deg,#fb7185,#ef4444)}
+
+/* ---- charts ---- */
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:12px}
+.panel{background:var(--panel);border:1px solid var(--panel-border);border-radius:14px;
+  padding:12px 14px 8px;backdrop-filter:blur(8px)}
+.panel h3{font-size:13.5px;font-weight:600;color:#aebfe6;margin-bottom:6px;display:flex;justify-content:space-between}
+.panel h3 .legend{display:flex;gap:12px;font-size:11.5px;color:var(--dim);font-weight:400}
+.panel h3 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.panel .cwrap{position:relative;height:190px}
+canvas.chart{width:100%;height:100%;display:block}
+.tip{position:fixed;z-index:50;pointer-events:none;display:none;background:rgba(10,16,32,.94);
+  border:1px solid rgba(130,160,255,.25);border-radius:9px;padding:8px 11px;font-size:12px;
+  color:var(--txt);box-shadow:0 8px 28px rgba(0,0,0,.45);white-space:nowrap}
+.tip .tt{color:var(--dim);margin-bottom:4px}
+
+/* ---- footer info ---- */
+.info{margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--panel-border);border-radius:14px;padding:12px 14px;font-size:12.5px}
+.card h4{font-size:12.5px;color:#aebfe6;margin-bottom:8px;font-weight:600}
+.card table{width:100%;border-collapse:collapse;table-layout:fixed}
+.card td{padding:3.5px 4px;color:var(--dim);vertical-align:middle}
+.card td:first-child{width:34%;white-space:nowrap}
+.card td:last-child{text-align:left;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .mono{font-family:Consolas,Menlo,monospace;font-size:11.5px;color:#9fb4e8}
+
+/* ---- modal ---- */
+.modal-bg{position:fixed;inset:0;background:rgba(4,7,15,.7);display:none;z-index:100;
+  align-items:center;justify-content:center;backdrop-filter:blur(3px)}
+.modal{width:420px;background:#0d1428;border:1px solid rgba(130,160,255,.25);border-radius:16px;padding:22px}
+.modal h3{font-size:16px;margin-bottom:14px;color:#cfe0ff}
+.modal label{display:block;font-size:12px;color:var(--dim);margin:12px 0 5px}
+.modal input{width:100%;padding:9px 12px;border-radius:9px;border:1px solid rgba(130,160,255,.25);
+  background:rgba(20,28,48,.8);color:var(--txt);font-size:13px;outline:none}
+.modal input:focus{border-color:var(--accent)}
+.modal .btns{display:flex;gap:10px;margin-top:20px;justify-content:flex-end}
+.modal button{padding:8px 18px;border-radius:9px;border:none;cursor:pointer;font-size:13px}
+#mOk{background:linear-gradient(92deg,#0891b2,#2563eb);color:#fff}
+#mCancel{background:transparent;border:1px solid rgba(130,160,255,.3);color:var(--dim)}
+.err{color:var(--rose);font-size:12px;margin-top:8px;min-height:15px}
+@media (max-width:900px){.kpi .val{font-size:22px}.brand h1{font-size:19px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+  <div class="brand"><h1>vLLM 推理监控大屏</h1></div>
+  <div class="toolbar">
+    <div class="tabs" id="tabs"></div>
+    <div class="spacer"></div>
+    <div class="ranges" id="ranges">
+      <button data-min="5">5 分钟</button><button data-min="15" class="active">15 分钟</button>
+      <button data-min="60">1 小时</button><button data-min="0">全部</button>
+    </div>
+    <div class="gearwrap">
+      <button id="gearBtn" title="设置">⚙</button>
+      <div class="menu" id="gearMenu">
+        <div class="mi" id="miAdd">＋ 添加监控目标</div>
+        <div class="mi" id="miExport">⬇ 导出日志（CSV）</div>
+      </div>
+    </div>
+  </div>
+</header>
+  <div id="banner"></div>
+
+  <div class="zone">
+    <div class="zleft">
+      <div class="card modelcard"><h4>模型 / 接入信息</h4><table id="tb-model"></table></div>
+      <div class="kpis" id="kpis"></div>
+    </div>
+    <div class="nodes" id="nodeStrip" style="display:none">
+      <div class="card"><h4>服务器信息</h4><table id="tb-node"></table></div>
+      <div class="kpi" id="nd-mem"><div class="lbl"><span>内存</span></div><div class="val c-blue">—</div><div class="bar"><i></i></div><div class="sub"></div></div>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="panel"><h3>Decode 吞吐<span class="legend" id="lg-dec"></span></h3><div class="cwrap"><canvas class="chart" id="ch-dec"></canvas></div></div>
+    <div class="panel"><h3>Prefill 吞吐<span class="legend" id="lg-pre"></span></h3><div class="cwrap"><canvas class="chart" id="ch-pre"></canvas></div></div>
+    <div class="panel"><h3>KV Cache 使用率<span class="legend" id="lg-kv"></span></h3><div class="cwrap"><canvas class="chart" id="ch-kv"></canvas></div></div>
+    <div class="panel"><h3>并发请求<span class="legend" id="lg-cc"></span></h3><div class="cwrap"><canvas class="chart" id="ch-cc"></canvas></div></div>
+    <div class="panel"><h3>延迟分位（窗口 p95）<span class="legend" id="lg-lat"></span></h3><div class="cwrap"><canvas class="chart" id="ch-lat"></canvas></div></div>
+  </div>
+
+  <div class="info">
+    <div class="card"><h4>请求统计</h4><table id="tb-req"></table></div>
+    <div class="card"><h4>目标信息</h4><table id="tb-info"></table></div>
+    <div class="card"><h4>累计量</h4><table id="tb-total"></table></div>
+  </div>
+</div>
+
+<div class="modal-bg" id="modalBg">
+  <div class="modal">
+    <h3>添加监控目标</h3>
+    <label>名称</label><input id="mName" placeholder="例如 prod-1">
+    <label>vLLM 服务地址（自动拼 /metrics）</label><input id="mUrl" placeholder="http://127.0.0.1:8123">
+    <label>API Key（--api-key 设置过 /metrics 可匿名时留空）</label><input id="mKey" placeholder="可选">
+    <label>模型权重路径（可选，模型卡展示）</label><input id="mPath" placeholder="/data/models/your-model">
+    <label>最大上下文（可选）</label><input id="mCtx" placeholder="1048576">
+    <div class="err" id="mErr"></div>
+    <div class="btns"><button id="mCancel">取消</button><button id="mOk">添加</button></div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+"use strict";
+/* ---------------- 全局状态 ---------------- */
+let targets=[], activeId=null, rangeMin=15, data=null, timer=null;
+
+const $=id=>document.getElementById(id);
+const fmtInt=v=>v==null?"—":Math.round(v).toLocaleString("en-US");
+const fmt1=v=>v==null?"—":v.toFixed(1);
+function fmtRate(v){if(v==null)return"—";if(v>=1000)return fmtInt(v);if(v>=100)return v.toFixed(0);return v.toFixed(1);}
+function fmtMs(s){if(s==null)return"—";const ms=s*1000;if(ms>=10000)return (ms/1000).toFixed(1)+"s";if(ms>=100)return ms.toFixed(0);return ms.toFixed(1);}
+function fmtPct(v,d=1){return v==null?"—":(v*100).toFixed(d)+"%";}
+function fmtTok(n){if(n==null)return"—";if(n>=1e9)return (n/1e9).toFixed(2)+"B";if(n>=1e6)return (n/1e6).toFixed(2)+"M";if(n>=1e3)return (n/1e3).toFixed(1)+"K";return ""+Math.round(n);}
+function hhmmss(t){const d=new Date(t*1000);return [d.getHours(),d.getMinutes(),d.getSeconds()].map(x=>String(x).padStart(2,"0")).join(":");}
+function hhmm(t){const d=new Date(t*1000);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
+
+/* ---------------- KPI 卡片定义 ---------------- */
+const KPIS=[
+ {id:"gen",  lbl:"Decode 吞吐",  cls:"c-cyan",  unit:"tok/s", key:"gen_rate",  fmt:fmtRate, sub:d=>"累计 "+fmtTok(d.now.gen_tokens_total)},
+ {id:"pf",   lbl:"Prefill 吞吐", cls:"c-violet",unit:"tok/s", key:"prompt_rate",fmt:fmtRate, sub:d=>"累计 "+fmtTok(d.now.prompt_tokens_total)},
+ {id:"kv",   lbl:"KV Cache 剩余", cls:"c-green", unit:"",    key:null,       fmt:null,
+   render:(el,d)=>{const p=d.now.kv_perc;const rem=p==null?null:1-p;
+     el.querySelector(".val").innerHTML=(rem==null?"—":fmtPct(rem,1))+`<span class="unit">剩余</span>`;
+     const bar=el.querySelector(".bar i");const used=p==null?0:p;
+     bar.style.width=(used*100).toFixed(1)+"%";
+     bar.className=used>=0.9?"crit":used>=0.7?"warn":"";
+     el.querySelector(".sub").textContent=d.kv_max_tokens?("池 "+fmtTok(d.kv_max_tokens)+" · 已用 "+fmtTok(d.now.kv_used_tokens)):"";},
+   html:`<div class="bar"><i></i></div>`},
+ {id:"run",  lbl:"运行中请求", cls:"c-blue",  unit:"路",    key:"running",   fmt:fmtInt, sub:d=>"排队 "+fmtInt(d.now.waiting)+" 路"},
+ {id:"ttft", lbl:"TTFT p95",   cls:"c-violet",unit:"ms",    key:"ttft_p95",  fmt:fmtMs,  sub:d=>"p50 "+fmtMs(d.now.ttft_p50)},
+ {id:"tpot", lbl:"TPOT p95",   cls:"c-amber", unit:"ms",    key:"tpot_p95",  fmt:fmtMs,  sub:d=>"p50 "+fmtMs(d.now.tpot_p50)},
+ {id:"e2e",  lbl:"端到端 p95", cls:"c-blue",  unit:"",      key:"e2e_p95",   fmt:fmtMs,  sub:d=>"排队 p95 "+fmtMs(d.now.queue_p95)},
+ {id:"pc",   lbl:"前缀缓存命中", cls:"c-cyan", unit:"",     key:"prefix_hit",fmt:fmtPct, sub:()=>""},
+ {id:"spec", lbl:"投机接受率", cls:"c-violet",unit:"",      key:"spec_accept",fmt:fmtPct, sub:()=>""},
+ {id:"pre",  lbl:"KV 抢占",    cls:"c-rose",  unit:"次",    key:null,        fmt:null,
+   render:(el,d)=>{el.querySelector(".val").innerHTML=fmtInt(d.now.preemptions)+`<span class="unit">次</span>`;},
+   html:``},
+ {id:"fin",  lbl:"已完成请求", cls:"c-green", unit:"个",    key:null,        fmt:null,
+   render:(el,d)=>{el.querySelector(".val").innerHTML=fmtInt(d.now._fin_total)+`<span class="unit">个</span>`;
+     el.querySelector(".sub").textContent=d.now._fin_len!=null?("length "+fmtInt(d.now._fin_len)+" · stop "+fmtInt(d.now._fin_stop)):"";},
+   html:``},
+];
+function buildKpis(){
+  const box=$("kpis");box.innerHTML="";
+  for(const k of KPIS){
+    const el=document.createElement("div");el.className="kpi";el.id="kpi-"+k.id;
+    el.innerHTML=`<div class="lbl"><span>${k.lbl}</span></div><div class="val">—</div>${k.html||""}<div class="sub"></div>`+
+      (k.key?`<canvas class="spark" id="sp-${k.id}"></canvas>`:"");
+    box.appendChild(el);
+  }
+}
+
+/* ---------------- Canvas 图表 ---------------- */
+class Chart{
+  constructor(id,cfg){
+    this.cv=$(id);this.ctx=this.cv.getContext("2d");this.cfg=cfg;
+    this.t=[];this.data={};this.hover=-1;
+    this.cv.addEventListener("mousemove",e=>this.onMove(e));
+    this.cv.addEventListener("mouseleave",()=>{this.hover=-1;$("tip").style.display="none";this.draw();});
+    new ResizeObserver(()=>this.draw()).observe(this.cv.parentElement);
+  }
+  setData(t,map){this.t=t;this.data=map;this.draw();}
+  visible(){
+    const t=this.t;if(!t.length)return[[],{}];
+    let i0=0;
+    if(rangeMin>0){const lo=t[t.length-1]-rangeMin*60;while(i0<t.length&&t[i0]<lo)i0++;}
+    const map={};for(const s of this.cfg.series)map[s.key]=(this.data[s.key]||[]).slice(i0);
+    return[t.slice(i0),map];
+  }
+  onMove(e){
+    const[t,map]=this.visible();if(t.length<2)return;
+    const r=this.cv.getBoundingClientRect();
+    const x=(e.clientX-r.left);
+    const pl=10,pr=54;
+    const wCss=this.cv.width/(devicePixelRatio||1), hCss=this.cv.height/(devicePixelRatio||1);
+    const pw=wCss-pl-pr;
+    let i=Math.round((x-pl)/pw*(t.length-1));i=Math.max(0,Math.min(t.length-1,i));
+    this.hover=i;this.draw();
+    const tip=$("tip");
+    let html=`<div class="tt">${hhmmss(t[i])}</div>`;
+    for(const s of this.cfg.series){const v=(map[s.key]||[])[i];
+      html+=`<div><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${s.color};margin-right:6px"></i>${s.label}: <b>${this.cfg.fmt?this.cfg.fmt(v):fmtInt(v)}</b></div>`;}
+    tip.innerHTML=html;tip.style.display="block";
+    tip.style.left=Math.min(window.innerWidth-tip.offsetWidth-8,e.clientX+14)+"px";
+    tip.style.top=Math.min(window.innerHeight-tip.offsetHeight-8,e.clientY+14)+"px";
+  }
+  draw(){
+    const dpr=devicePixelRatio||1,w=this.cv.parentElement.clientWidth,h=this.cv.parentElement.clientHeight;
+    if(this.cv.width!==w*dpr||this.cv.height!==h*dpr){this.cv.width=w*dpr;this.cv.height=h*dpr;}
+    const c=this.ctx;c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);
+    const[t,map]=this.visible();this.vt=t;this.vmap=map;
+    if(t.length<2){c.fillStyle="#7f8db0";c.font="12px sans-serif";c.fillText("等待数据…",w/2-30,h/2);return;}
+    const pl=10,pr=54,pt=8,pb=20,pw=w-pl-pr,ph=h-pt-pb;
+    let ymax=0;
+    for(const s of this.cfg.series)for(const v of map[s.key]||[])if(v!=null&&v>ymax)ymax=v;
+    if(!ymax)ymax=1;
+    ymax*=1.12;
+    const logY=this.cfg.logY;
+    let Y,vmin=0,vmaxL=0,vminL=0,step=1,top=1;
+    if(logY){
+      let lo=Infinity;
+      for(const s of this.cfg.series)for(const v of map[s.key]||[])if(v!=null&&v>0){if(v<lo)lo=v;if(v>ymax)ymax=v;}
+      if(!isFinite(lo)){lo=0.001;}
+      vmaxL=Math.log10(ymax);vminL=Math.log10(lo/1.5);
+      if(vmaxL-vminL<0.8)vmaxL=vminL+0.8;
+      Y=v=>pt+ph-(Math.log10(Math.max(v,Math.pow(10,vminL)))-vminL)/(vmaxL-vminL)*ph;
+    }else{
+      step=niceStep(ymax/4);
+      top=Math.ceil(ymax/step)*step;
+      Y=v=>pt+ph-(v/top)*ph;
+    }
+    const X=i=>pl+i/(t.length-1)*pw;
+    // 网格
+    c.strokeStyle="rgba(130,160,255,.09)";c.fillStyle="#66799c";c.font="10px sans-serif";c.lineWidth=1;
+    const ticks=[];
+    if(logY){
+      for(let e=Math.ceil(vminL);e<=Math.floor(vmaxL);e++)
+        for(const m of [1,2,5]){const v=m*Math.pow(10,e);
+          if(Math.log10(v)>=vminL-1e-9&&Math.log10(v)<=vmaxL+1e-9)ticks.push(v);}
+    }else{
+      for(let v=0;v<=top+1e-9;v+=step)ticks.push(v);
+    }
+    for(const v of ticks){const y=Y(v);c.beginPath();c.moveTo(pl,y);c.lineTo(pl+pw,y);c.stroke();
+      c.fillText(this.cfg.axisFmt?this.cfg.axisFmt(v):fmtInt(v),pl+pw+6,y+3);}
+    // x 轴标签
+    const nx=Math.max(2,Math.min(6,Math.floor(pw/110)));
+    for(let k=0;k<=nx;k++){const i=Math.round(k/nx*(t.length-1));
+      c.fillText(hhmm(t[i]),X(i)-14,h-6);}
+    // 阈值线
+    if(this.cfg.thresh!=null){const y=Y(this.cfg.thresh);
+      c.strokeStyle="rgba(251,113,133,.5)";c.setLineDash([4,4]);c.beginPath();c.moveTo(pl,y);c.lineTo(pl+pw,y);c.stroke();c.setLineDash([]);}
+    // 序列
+    for(const s of this.cfg.series){
+      const arr=map[s.key]||[];
+      c.strokeStyle=s.color;c.lineWidth=1.8;c.lineJoin="round";
+      if(s.fill){const g=c.createLinearGradient(0,pt,0,pt+ph);
+        g.addColorStop(0,s.color+"44");g.addColorStop(1,s.color+"05");
+        c.fillStyle=g;}
+      c.beginPath();let started=false,firstX=0,firstY=0,lastX=0,lastY=0;
+      for(let i=0;i<arr.length;i++){const v=arr[i];if(v==null){continue;}
+        const x=X(i),y=Y(Math.min(v,ymax));
+        if(!started){c.moveTo(x,y);started=true;firstX=x;firstY=y;}else c.lineTo(x,y);
+        lastX=x;lastY=y;}
+      if(started){
+        if(s.fill){c.save();c.lineTo(lastX,pt+ph);c.lineTo(firstX,pt+ph);c.closePath();c.fill();c.restore();
+          c.beginPath();let st2=false;
+          for(let i=0;i<arr.length;i++){const v=arr[i];if(v==null)continue;
+            const x=X(i),y=Y(Math.min(v,ymax));if(!st2){c.moveTo(x,y);st2=true;}else c.lineTo(x,y);}}
+        c.stroke();}
+    }
+    // hover
+    if(this.hover>=0&&this.hover<t.length){
+      const x=X(this.hover);
+      c.strokeStyle="rgba(160,190,255,.35)";c.beginPath();c.moveTo(x,pt);c.lineTo(x,pt+ph);c.stroke();
+      for(const s of this.cfg.series){const v=map[s.key][this.hover];
+        if(v==null)continue;c.fillStyle=s.color;c.beginPath();c.arc(x,Y(Math.min(v,ymax)),3,0,7);c.fill();}
+    }
+  }
+}
+function niceStep(x){const p=Math.pow(10,Math.floor(Math.log10(x||1)));const m=x/p;
+  return (m>=5?10:m>=2?5:m>=1?2:1)*p;}
+
+const CH={};
+function buildCharts(){
+  const mk=(id,legend,series,extra={})=>{CH[id]=new Chart(id,Object.assign({series},extra));
+    $(legend).innerHTML=series.map(s=>`<span><i style="background:${s.color}"></i>${s.label}</span>`).join("");};
+  mk("ch-dec","lg-dec",[
+    {key:"gen_rate",label:"Decode tok/s",color:"#22d3ee",fill:true}]);
+  mk("ch-pre","lg-pre",[
+    {key:"prompt_rate",label:"Prefill tok/s",color:"#a78bfa",fill:true}]);
+  mk("ch-kv","lg-kv",[
+    {key:"kv_perc",label:"已用比例",color:"#34d399",fill:true}],
+    {thresh:0.9,axisFmt:v=>{const p=v*100;return (p>=10?p.toFixed(0):p>=1?p.toFixed(1):p.toFixed(2))+"%";},fmt:v=>fmtPct(v)});
+  mk("ch-cc","lg-cc",[
+    {key:"running",label:"运行中",color:"#60a5fa",fill:true},
+    {key:"waiting",label:"排队",color:"#fbbf24",fill:true}]);
+  mk("ch-lat","lg-lat",[
+    {key:"ttft_p95",label:"TTFT p95",color:"#a78bfa"},
+    {key:"tpot_p95",label:"TPOT p95",color:"#fbbf24"},
+    {key:"e2e_p95",label:"端到端 p95",color:"#fb7185"},
+    {key:"queue_p95",label:"排队 p95",color:"#38bdf8"}],
+    {fmt:fmtMs,axisFmt:fmtMs,logY:true});
+  CH["ch-lat"].cfg.fmt=fmtMs;
+}
+function drawSpark(id,key){
+  const el=$(id);if(!el||!data)return;const col=data.series[key]||[];
+  const w=66,h=27,dpr=devicePixelRatio||1;
+  if(el.width!==w*dpr){el.width=w*dpr;el.height=h*dpr;}
+  const c=el.getContext("2d");c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);
+  const pts=col.slice(-90).map(v=>v==null?null:v);
+  let mx=0;for(const v of pts)if(v!=null&&v>mx)mx=v;if(!mx)return;
+  c.strokeStyle="#67e8f9";c.lineWidth=1.2;c.beginPath();let st=false;
+  pts.forEach((v,i)=>{if(v==null)return;const x=i/(pts.length-1)*w,y=h-2-(v/mx)*(h-5);
+    if(!st){c.moveTo(x,y);st=true;}else c.lineTo(x,y);});
+  c.stroke();
+}
+
+/* ---------------- 数据轮询 ---------------- */
+async function pollTargets(){
+  try{
+    const r=await fetch("/api/targets");const j=await r.json();
+    targets=j.targets||[];
+    renderTabs();
+    if(!activeId&&targets.length)activeId=targets[0].id;
+  }catch(e){}
+}
+async function pollData(){
+  if(!activeId||document.hidden)return;
+  try{
+    const r=await fetch("/api/data?id="+encodeURIComponent(activeId)+"&maxpoints=1500");
+    data=await r.json();
+    if(data.error){data=null;return;}
+    render();
+  }catch(e){}
+}
+function renderTabs(){
+  const box=$("tabs");box.innerHTML="";
+  for(const t of targets){
+    const el=document.createElement("div");
+    el.className="tab"+(t.id===activeId?" active":"");
+    el.innerHTML=`<span class="led ${t.status}"></span><span class="nm">${t.name}</span><span class="x" title="移除">✕</span>`;
+    el.onclick=e=>{
+      if(e.target.classList.contains("x")){
+        if(confirm("移除目标 "+t.name+"？")){fetch("/api/targets/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:t.id})}).then(()=>{if(activeId===t.id)activeId=null;pollTargets();});}
+        return;}
+      activeId=t.id;renderTabs();pollData();};
+    box.appendChild(el);
+  }
+}
+function render(){
+  const d=data;if(!d)return;
+  const b=$("banner");
+  if(d.status==="down"){b.style.display="block";b.innerHTML=`⚠ 目标 <b>${esc(d.name)}</b> 抓取失败：${esc(d.last_error||"")}（URL: ${esc(d.url)}/metrics）`;}
+  else b.style.display="none";
+  // KPI
+  for(const k of KPIS){
+    const el=$("kpi-"+k.id);
+    const show=(k.id!=="pc"||d.has_prefix_cache)&&(k.id!=="spec"||d.has_spec);
+    el.classList.toggle("hidden",!show);if(!show)continue;
+    if(k.render)k.render(el,d);
+    else{el.querySelector(".val").innerHTML=k.fmt(d.now[k.key])+`<span class="unit">${k.unit}</span>`;
+      const sub=el.querySelector(".sub");if(sub)sub.textContent=k.sub?k.sub(d):"";
+      drawSpark("sp-"+k.id,k.key);}
+  }
+  // charts
+  CH["ch-dec"].setData(d.series.t,d.series);
+  CH["ch-pre"].setData(d.series.t,d.series);
+  CH["ch-kv"].setData(d.series.t,d.series);
+  CH["ch-cc"].setData(d.series.t,d.series);
+  CH["ch-lat"].setData(d.series.t,d.series);
+  // tables
+  $("tb-req").innerHTML=`
+   <tr><td>运行 / 排队 / 换出</td><td>${fmtInt(d.now.running)} / ${fmtInt(d.now.waiting)} / ${fmtInt(d.now.swapped)}</td></tr>
+   <tr><td>Decode / Prefill 吞吐</td><td>${fmtRate(d.now.gen_rate)} / ${fmtRate(d.now.prompt_rate)} tok/s</td></tr>
+   <tr><td>TTFT p50 / p95</td><td>${fmtMs(d.now.ttft_p50)} / ${fmtMs(d.now.ttft_p95)}</td></tr>
+   <tr><td>TPOT p50 / p95</td><td>${fmtMs(d.now.tpot_p50)} / ${fmtMs(d.now.tpot_p95)}</td></tr>
+   <tr><td>端到端 / 排队 p95</td><td>${fmtMs(d.now.e2e_p95)} / ${fmtMs(d.now.queue_p95)}</td></tr>
+   ${d.has_spec?`<tr><td>投机接受率</td><td>${fmtPct(d.now.spec_accept)}</td></tr>`:""}
+   ${d.has_prefix_cache?`<tr><td>前缀缓存命中</td><td>${fmtPct(d.now.prefix_hit)}</td></tr>`:""}`;
+  $("tb-info").innerHTML=`
+   <tr><td>名称 / 状态</td><td>${esc(d.name)} · ${d.status==="up"?"<span style='color:#6ee7b7'>正常</span>":"<span style='color:#fda4af'>失联</span>"}</td></tr>
+   <tr><td>metrics 地址</td><td class="mono">${esc(d.url)}/metrics</td></tr>
+   <tr><td>抓取间隔 / 保留点数</td><td>${d.interval}s / ${d.meta.points}</td></tr>
+   <tr><td>最近抓取</td><td>${d.last_ts?hhmmss(d.last_ts):"—"}</td></tr>
+   <tr><td>KV 池容量</td><td>${d.kv_max_tokens?fmtTok(d.kv_max_tokens)+" token":"—"}</td></tr>`;
+  const mi=d.meta_info||{};
+  const mid=(mi.model_ids&&mi.model_ids.length)?mi.model_ids.join(", "):
+            (d.model_path?d.model_path.split("/").filter(Boolean).pop():"—");
+  let ver=mi.version||"";
+  try{const j=JSON.parse(ver);ver=(j.version||ver)+(j.rust_frontend_version?" (rust fe "+j.rust_frontend_version+")":"");}catch(e){}
+  const apiBase=d.url.replace(/^(https?:\/\/)(127\.0\.0\.1|localhost)(:|\/)/,"$1"+location.hostname+"$3");
+  $("tb-model").innerHTML=`
+   <tr><td>模型 ID</td><td class="mono">${esc(mid)}</td></tr>
+   <tr><td>上下文长度</td><td>${d.context_len?esc(d.context_len):"—"}</td></tr>
+   <tr><td>权重路径</td><td class="mono">${d.model_path?esc(d.model_path):"—"}</td></tr>
+   <tr><td>接入地址</td><td class="mono">${esc(apiBase)}/v1</td></tr>
+   <tr><td>API Key</td><td class="mono">${d.api_key?esc(d.api_key):"（无鉴权）"}</td></tr>
+   <tr><td>vLLM 版本</td><td>${ver?esc(ver):"—"}</td></tr>`;
+  $("tb-total").innerHTML=`
+   <tr><td>累计生成 token</td><td>${fmtTok(d.now.gen_tokens_total)}</td></tr>
+   <tr><td>累计预填充 token</td><td>${fmtTok(d.now.prompt_tokens_total)}</td></tr>
+   <tr><td>KV 抢占次数</td><td>${fmtInt(d.now.preemptions)}</td></tr>
+   <tr><td>监控已运行</td><td>${uptimeStr(d.monitor_since)}</td></tr>`;
+}
+function uptimeStr(ts){const s=Math.max(0,Date.now()/1000-ts);const m=Math.floor(s/60);
+  return m>=60?Math.floor(m/60)+" 小时 "+(m%60)+" 分":m+" 分 "+Math.floor(s%60)+" 秒";}
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+/* ---------------- 交互 ---------------- */
+/* ---------------- 交互：齿轮菜单 ---------------- */
+const gearBtn=$("gearBtn"),gearMenu=$("gearMenu");
+gearBtn.onclick=e=>{e.stopPropagation();
+  const open=gearMenu.style.display==="block";
+  gearMenu.style.display=open?"none":"block";
+  gearBtn.classList.toggle("open",!open);};
+document.addEventListener("click",e=>{
+  if(!e.target.closest(".gearwrap")){gearMenu.style.display="none";gearBtn.classList.remove("open");}});
+$("miAdd").onclick=()=>{gearMenu.style.display="none";$("mErr").textContent="";
+  $("modalBg").style.display="flex";$("mName").focus();};
+$("miExport").onclick=()=>{gearMenu.style.display="none";doExport();};
+
+function doExport(){
+  if(!data||!data.series||!data.series.t||!data.series.t.length){alert("当前无数据可导出");return;}
+  const keys=["gen_rate","prompt_rate","running","waiting","kv_perc",
+    "ttft_p50","ttft_p95","tpot_p50","tpot_p95","e2e_p95","queue_p95","spec_accept","prefix_hit"];
+  const names={gen_rate:"decode_tok_s",prompt_rate:"prefill_tok_s",running:"running",waiting:"waiting",
+    kv_perc:"kv_used",ttft_p50:"ttft_p50_s",ttft_p95:"ttft_p95_s",tpot_p50:"tpot_p50_s",tpot_p95:"tpot_p95_s",
+    e2e_p95:"e2e_p95_s",queue_p95:"queue_p95_s",spec_accept:"spec_accept",prefix_hit:"prefix_hit"};
+  const t=data.series.t;
+  const L=[];
+  L.push("# vLLM 推理监控大屏 - 监控日志导出");
+  L.push("# target: "+data.name+"    metrics: "+data.url+"/metrics");
+  L.push("# exported_at: "+new Date().toLocaleString("zh-CN"));
+  L.push("# points: "+t.length+"    interval_s: "+data.interval);
+  L.push("# 注: 吞吐=tok/s(12s窗口差分); 延迟=秒(30s窗口直方图分位); kv_used=已用比例");
+  L.push("time,"+keys.map(k=>names[k]).join(","));
+  for(let i=0;i<t.length;i++){
+    const row=[hhmmss(t[i])];
+    for(const k of keys){const v=data.series[k][i];
+      row.push(v==null?"":String(Math.round(v*10000)/10000));}
+    L.push(row.join(","));
+  }
+  const blob=new Blob(["\ufeff"+L.join("\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=(data.name||"vllm").replace(/[^\w\u4e00-\u9fa5.-]+/g,"_")+"_metrics_"+
+    new Date().toISOString().replace(/[:.]/g,"-").slice(0,19)+".csv";
+  a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+$("mCancel").onclick=()=>$("modalBg").style.display="none";
+$("modalBg").onclick=e=>{if(e.target===$("modalBg"))$("modalBg").style.display="none";};
+$("mOk").onclick=async()=>{
+  try{
+    const r=await fetch("/api/targets",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name:$("mName").value.trim()||"target",url:$("mUrl").value.trim(),
+        api_key:$("mKey").value.trim(),model_path:$("mPath").value.trim(),context_len:$("mCtx").value.trim()})});
+    const j=await r.json();
+    if(j.error){$("mErr").textContent=j.error;return;}
+    $("modalBg").style.display="none";
+    $("mName").value=$("mUrl").value=$("mKey").value=$("mPath").value=$("mCtx").value="";
+    activeId=j.id;await pollTargets();pollData();
+  }catch(e){$("mErr").textContent="添加失败: "+e;}
+};
+
+/* ---------------- 服务器资源（/api/node） ---------------- */
+let nodeData=null;
+async function pollNode(){
+  try{const r=await fetch("/api/node");nodeData=await r.json();renderNode();}
+  catch(e){}
+}
+function setBar(el,pct,warn=70,crit=90){
+  const i=el.querySelector(".bar i");if(!i)return;
+  i.style.width=Math.max(0,Math.min(100,pct))+"%";
+  i.className=pct>=crit?"crit":pct>=warn?"warn":"";
+}
+function renderNode(){
+  const n=nodeData;if(!n)return;
+  const strip=$("nodeStrip");
+  if(!n.available){strip.style.display="none";return;}
+  strip.style.display="grid";
+  const now=n.now||{};
+  const ndMem=$("nd-mem");
+  if(n.has_proc&&now.mem_total){
+    ndMem.querySelector(".val").innerHTML=now.mem_used.toFixed(0)+'<span class="unit">/ '+now.mem_total.toFixed(0)+' GB</span>';
+    ndMem.querySelector(".sub").textContent=(now.mem_perc!=null?now.mem_perc.toFixed(1)+"% 已用":"");
+  }else{ndMem.querySelector(".val").textContent="—";ndMem.querySelector(".sub").textContent="";}
+  setBar(ndMem,now.mem_perc||0,80,92);
+  const nG=(n.per_gpu||[]).length;
+  function fmtUp(s){if(s==null)return"—";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+    return (d?d+" 天 ":"")+(d||h?h+" 小时 ":"")+m+" 分";}
+  function ibar(p,warn,crit){const w=Math.max(0,Math.min(100,p||0));
+    const col=(p||0)>=crit?"#fb7185":(p||0)>=warn?"#fbbf24":"#34d399";
+    return `<span style="display:inline-block;width:66px;height:6px;border-radius:3px;background:rgba(130,160,255,.12);vertical-align:middle;margin-left:9px"><span style="display:inline-block;width:${w}%;height:100%;border-radius:3px;background:${col}"></span></span>`;}
+  $("tb-node").innerHTML=`
+   <tr><td>IP / 主机名</td><td class="mono">${esc(n.ip)} / ${esc(n.hostname)}</td></tr>
+   <tr><td>服务器时间</td><td>${n.time?new Date(n.time*1000).toLocaleString("zh-CN",{hour12:false}):"—"}</td></tr>
+   <tr><td>运行时间</td><td>${fmtUp(n.uptime_s)}</td></tr>
+   <tr><td>CPU 型号</td><td class="mono">${esc(n.cpu_name||"—")}${n.cpu_cores?" / "+n.cpu_cores+" 核":""}</td></tr>
+   <tr><td>CPU 使用率</td><td>${n.has_proc&&now.cpu!=null?now.cpu.toFixed(1)+"%"+ibar(now.cpu,70,90):"—"}</td></tr>
+   <tr><td>GPU 利用率</td><td>${n.has_gpu&&now.gpu_util!=null?now.gpu_util.toFixed(1)+"%"+ibar(now.gpu_util,70,95):"—"}</td></tr>
+   <tr><td>GPU 型号 / 数量</td><td class="mono">${esc(n.gpu_name||"—")}${nG?" / "+nG+" 卡":""}</td></tr>
+   <tr><td>系统</td><td class="mono">${esc(n.os_pretty||String(n.platform||"").slice(0,52)||"—")}</td></tr>
+   <tr><td>内核</td><td class="mono">${esc(n.kernel||"—")}</td></tr>`;
+}
+
+$("ranges").onclick=e=>{
+  if(e.target.tagName!=="BUTTON")return;
+  for(const b of $("ranges").children)b.classList.toggle("active",b===e.target);
+  rangeMin=parseInt(e.target.dataset.min);
+  for(const k in CH)CH[k].draw();
+};
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)pollData();});
+
+/* ---------------- 启动 ---------------- */
+buildKpis();buildCharts();
+pollTargets();pollData();pollNode();
+setInterval(pollTargets,10000);
+setInterval(pollData,2000);
+setInterval(pollNode,3000);
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    main()

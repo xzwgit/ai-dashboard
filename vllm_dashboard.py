@@ -31,6 +31,7 @@ import math
 import os
 import random
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -38,11 +39,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "1.0.0"    # v1 定版（2026-10-26）：监控大屏基础功能
+VERSION = "2.0.0"    # v2：+内置轻量网关（API 分发）；v1 冻结副本 vllm_dashboard_v1.py
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
@@ -849,6 +851,411 @@ class DemoEngine:
         return "\n".join(L) + "\n"
 
 
+# ============================== 内置轻量网关（API 分发） ==============================
+
+GW_CONNECT_TIMEOUT = 15.0
+GW_STREAM_IDLE_TIMEOUT = 300.0    # 流式两 chunk 间空闲上限（长思考不误杀）
+GW_REQ_TIMEOUT = 600.0
+GW_BREAK_NFAIL = 3                # 连接类连续失败 N 次 → 熔断
+GW_BREAK_SECONDS = 60.0
+
+
+class Gateway:
+    """API 分发网关：渠道 + Key 管理 + 限流记账，线程安全，持久化 gateway.json（含用量）。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.enabled = True            # 转发开关（面板可暂停）
+        self.data = {"channels": [], "keys": []}
+        self.rpm_win = {}
+        self.chan = {}
+        self.totals = {"requests": 0, "ok": 0, "fail": 0, "tokens": 0}
+        self.started = time.time()
+        self._load()
+        threading.Thread(target=self._flush_loop, daemon=True).start()
+
+    def _load(self):
+        if self.path and os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+            except Exception:
+                pass
+        self.data.setdefault("channels", [])
+        self.data.setdefault("keys", [])
+        for c in self.data["channels"]:
+            self.chan[c["name"]] = self._blank_chan()
+
+    @staticmethod
+    def _blank_chan():
+        return {"requests": 0, "ok": 0, "fail": 0, "tokens": 0,
+                "lat_ms": 0.0, "consec": 0, "broken_until": 0.0}
+
+    def _flush_loop(self):
+        while True:
+            time.sleep(30)
+            try:
+                self.save()
+            except Exception:
+                pass
+
+    def save(self):
+        if not self.path:
+            return
+        with self.lock:
+            try:
+                d = os.path.dirname(self.path)
+                if d:
+                    os.makedirs(d, exist_ok=True)
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=1)
+            except Exception:
+                pass
+
+    # ---------- Key ----------
+    def gen_key(self, name, rpm=0, quota_tokens=0):
+        with self.lock:
+            k = "sk-" + secrets.token_hex(12)
+            self.data["keys"].append({
+                "key": k, "name": (name or "").strip() or "unnamed",
+                "rpm": int(rpm or 0), "quota_tokens": int(quota_tokens or 0),
+                "used_tokens": 0, "used_requests": 0, "enabled": True,
+                "created": time.time()})
+            self.save()
+            return k
+
+    def get_key(self, key):
+        for k in self.data["keys"]:
+            if k["key"] == key:
+                return k
+        return None
+
+    def key_op(self, key, op, rpm=None, quota_tokens=None):
+        with self.lock:
+            for k in self.data["keys"]:
+                if k["key"] == key:
+                    if op == "toggle":
+                        k["enabled"] = not k["enabled"]
+                    elif op == "delete":
+                        self.data["keys"].remove(k)
+                    elif op == "quota":
+                        if rpm is not None:
+                            k["rpm"] = int(rpm or 0)
+                        if quota_tokens is not None:
+                            k["quota_tokens"] = int(quota_tokens or 0)
+                    self.save()
+                    return True
+            return False
+
+    # ---------- 渠道 ----------
+    def add_channel(self, name, base_url, api_key="", priority=1, weight=10):
+        with self.lock:
+            name = (name or "").strip()
+            if not name or not base_url or any(c["name"] == name for c in self.data["channels"]):
+                return False
+            self.data["channels"].append({
+                "name": name, "base_url": base_url.rstrip("/"), "api_key": api_key or "",
+                "priority": int(priority or 1), "weight": max(1, int(weight or 10)),
+                "enabled": True})
+            self.chan[name] = self._blank_chan()
+            self.save()
+            return True
+
+    def channel_op(self, name, op):
+        with self.lock:
+            for c in self.data["channels"]:
+                if c["name"] == name:
+                    if op == "toggle":
+                        c["enabled"] = not c["enabled"]
+                    elif op == "delete":
+                        self.data["channels"].remove(c)
+                        self.chan.pop(name, None)
+                    self.save()
+                    return True
+            return False
+
+    def pick_channel(self, exclude=()):
+        now = time.time()
+        with self.lock:
+            cands = [c for c in self.data["channels"]
+                     if c.get("enabled", True) and c["name"] not in exclude
+                     and self.chan.get(c["name"], {}).get("broken_until", 0) <= now]
+        if not cands:
+            return None
+        cands.sort(key=lambda c: c.get("priority", 1))
+        p0 = cands[0].get("priority", 1)
+        same = [c for c in cands if c.get("priority", 1) == p0]
+        tw = sum(c.get("weight", 10) for c in same)
+        r = random.uniform(0, tw)
+        acc = 0
+        for c in same:
+            acc += c.get("weight", 10)
+            if r <= acc:
+                return c
+        return same[-1]
+
+    # ---------- 鉴权限流 ----------
+    def check_key(self, key):
+        with self.lock:
+            k = self.get_key(key)
+            if k is None:
+                return (401, "无效的 API Key")
+            if not k.get("enabled", True):
+                return (403, "该 Key 已被停用，请联系管理员")
+            q = k.get("quota_tokens", 0)
+            if q and k.get("used_tokens", 0) >= q:
+                return (429, "token 配额已用尽（配额 %d）" % q)
+            rpm = k.get("rpm", 0)
+            if rpm:
+                now = time.time()
+                w = self.rpm_win.setdefault(key, deque())
+                while w and w[0] < now - 60:
+                    w.popleft()
+                if len(w) >= rpm:
+                    return (429, "超过 RPM 限额（%d 次/分钟）" % rpm)
+                w.append(now)
+            return None
+
+    # ---------- 记账 ----------
+    def chan_hit(self, name, ok, lat_ms=0.0, tokens=0, fail_pre=False):
+        with self.lock:
+            st = self.chan.setdefault(name, self._blank_chan())
+            self.totals["requests"] += 1
+            st["requests"] += 1
+            if ok:
+                self.totals["ok"] += 1
+                st["ok"] += 1
+                st["lat_ms"] += lat_ms
+                if tokens:
+                    self.totals["tokens"] += tokens
+                    st["tokens"] += tokens
+                st["consec"] = 0
+                st["broken_until"] = 0.0
+            else:
+                self.totals["fail"] += 1
+                st["fail"] += 1
+                if fail_pre:
+                    st["consec"] += 1
+                    if st["consec"] >= GW_BREAK_NFAIL:
+                        st["broken_until"] = time.time() + GW_BREAK_SECONDS
+
+    def account_key(self, key, tokens):
+        with self.lock:
+            k = self.get_key(key)
+            if k:
+                k["used_requests"] = k.get("used_requests", 0) + 1
+                k["used_tokens"] = k.get("used_tokens", 0) + (tokens or 0)
+
+    def snapshot(self, port):
+        with self.lock:
+            now = time.time()
+            chans = []
+            for c in self.data["channels"]:
+                st = self.chan.get(c["name"], self._blank_chan())
+                bu = st.get("broken_until", 0)
+                status = "paused" if not c.get("enabled", True) else ("broken" if bu > now else "ok")
+                avg = (st.get("lat_ms", 0) / st["ok"]) if st.get("ok") else 0
+                chans.append({"name": c["name"], "base_url": c["base_url"],
+                              "priority": c.get("priority", 1), "weight": c.get("weight", 10),
+                              "status": status, "broken_until": round(bu - now) if bu > now else 0,
+                              "requests": st.get("requests", 0), "ok": st.get("ok", 0),
+                              "fail": st.get("fail", 0), "tokens": st.get("tokens", 0),
+                              "avg_latency_ms": round(avg, 1)})
+            return {"enabled": self.enabled, "port": port, "since": self.started,
+                    "totals": dict(self.totals), "channels": chans,
+                    "keys": [dict(k) for k in self.data["keys"]]}
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    gw = None          # type: Gateway
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _api_err(self, code, msg, etype="invalid_request_error"):
+        self._json(code, {"error": {"message": msg, "type": etype, "code": code}})
+
+    def _client_key(self):
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Bearer "):
+            return h[7:].strip()
+        return self.headers.get("x-api-key", "").strip()
+
+    @staticmethod
+    def _usage_from_json(body):
+        try:
+            u = (json.loads(body.decode("utf-8", "replace")).get("usage")) or {}
+            return int(u.get("prompt_tokens", 0)) + int(u.get("completion_tokens", 0))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _usage_from_sse_tail(tail):
+        try:
+            for ln in reversed(tail.decode("utf-8", "replace").splitlines()):
+                ln = ln.strip()
+                if ln.startswith("data:") and "[DONE]" not in ln and '"usage"' in ln:
+                    u = (json.loads(ln[5:].strip()).get("usage")) or {}
+                    return int(u.get("prompt_tokens", 0)) + int(u.get("completion_tokens", 0))
+        except Exception:
+            pass
+        return 0
+
+    def do_GET(self):
+        if self.path.startswith("/gw/health"):
+            g = self.gw
+            self._json(200, {"ok": True, "enabled": g.enabled,
+                             "channels": len(g.data["channels"]), "keys": len(g.data["keys"])})
+        elif self.path.startswith("/gw/v1/"):
+            self._proxy("GET")
+        else:
+            self._api_err(404, "not found")
+
+    def do_POST(self):
+        if self.path.startswith("/gw/v1/"):
+            self._proxy("POST")
+        else:
+            self._api_err(404, "not found")
+
+    def _proxy(self, method):
+        gw = self.gw
+        if not gw.enabled:
+            self._api_err(503, "网关转发已暂停（管理面板可开启）", "server_error")
+            return
+        key = self._client_key()
+        if not key:
+            self._api_err(401, "缺少 API Key：请带 Authorization: Bearer sk-...")
+            return
+        err = gw.check_key(key)
+        if err:
+            self._api_err(err[0], err[1],
+                          "insufficient_quota" if err[0] == 429 else "invalid_request_error")
+            return
+        body = b""
+        if method == "POST":
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else b""
+        is_stream = False
+        if method == "POST" and body[:1] == b"{":
+            try:
+                j = json.loads(body.decode("utf-8", "replace"))
+                is_stream = bool(j.get("stream"))
+                if is_stream:
+                    so = j.setdefault("stream_options", {})
+                    if not isinstance(so, dict):
+                        so = {}
+                        j["stream_options"] = so
+                    so.setdefault("include_usage", True)
+                    body = json.dumps(j, ensure_ascii=False).encode("utf-8")
+            except Exception:
+                pass
+        with gw.lock:
+            nch = max(1, len(gw.data["channels"]))
+        tried = 0
+        tried_names = []
+        last_err = "无可用渠道"
+        while tried < nch:
+            tried += 1
+            ch = gw.pick_channel(exclude=tried_names)
+            if ch is None:
+                break
+            tried_names.append(ch["name"])
+            if ch is None:
+                break
+            t0 = time.time()
+            req = urllib.request.Request(ch["base_url"] + self.path[len("/gw"):],
+                                         data=body if method == "POST" else None,
+                                         method=method)
+            req.add_header("Content-Type", "application/json")
+            if ch.get("api_key"):
+                req.add_header("Authorization", "Bearer " + ch["api_key"])
+            try:
+                resp = urllib.request.urlopen(
+                    req, timeout=GW_STREAM_IDLE_TIMEOUT if is_stream else GW_REQ_TIMEOUT)
+            except urllib.error.HTTPError as e:
+                ebody = b""
+                try:
+                    ebody = e.read()
+                except Exception:
+                    pass
+                if e.code >= 502 and tried < nch:
+                    gw.chan_hit(ch["name"], False, fail_pre=True)
+                    last_err = "上游 HTTP %d" % e.code
+                    continue
+                gw.chan_hit(ch["name"], False)
+                self._passthrough(e.code, ebody,
+                                  e.headers.get("Content-Type", "application/json"))
+                return
+            except Exception as e:
+                gw.chan_hit(ch["name"], False, fail_pre=True)
+                last_err = "%s: %s" % (type(e).__name__, e)
+                continue
+            try:
+                if is_stream:
+                    self._relay_stream(resp, key, ch["name"], t0)
+                else:
+                    self._relay_plain(resp, key, ch["name"], t0)
+            except (BrokenPipeError, ConnectionResetError):
+                gw.chan_hit(ch["name"], True, (time.time() - t0) * 1000)
+                self.close_connection = True
+                return
+            return
+        self._api_err(502, "所有渠道不可用：%s" % last_err, "server_error")
+
+    def _passthrough(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype or "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+        self.close_connection = True
+
+    def _relay_plain(self, resp, key, name, t0):
+        body = resp.read()
+        tokens = self._usage_from_json(body)
+        self._passthrough(resp.status, body, resp.headers.get("Content-Type", "application/json"))
+        self.gw.chan_hit(name, True, (time.time() - t0) * 1000, tokens)
+        self.gw.account_key(key, tokens)
+
+    def _relay_stream(self, resp, key, name, t0):
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream"))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        tail = b""
+        try:
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    raise BrokenPipeError()
+                tail = (tail + chunk)[-32768:]
+        except socket.timeout:
+            pass    # 上游空闲超时：按流结束处理（已发出的数据保留）
+        tokens = self._usage_from_sse_tail(tail)
+        self.close_connection = True
+        self.gw.chan_hit(name, True, (time.time() - t0) * 1000, tokens)
+        self.gw.account_key(key, tokens)
+
 # ============================== Web 服务 ==============================
 
 HTML = None  # 见文件底部 _build_html()
@@ -858,6 +1265,8 @@ class Handler(BaseHTTPRequestHandler):
     reg = None       # type: Registry
     demo = None      # type: DemoEngine
     node = None      # type: NodeCollector
+    gw = None        # type: Gateway
+    gw_port = 0
     started = time.time()
 
     def log_message(self, fmt, *args):
@@ -887,6 +1296,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": t.id, "name": t.name, "url": t.url, "status": t.status,
                  "last_error": t.last_error, "last_ts": t.last_ts}
                 for t in Handler.reg.targets]})
+        elif path == "/api/gateway":
+            if Handler.gw:
+                self._json(Handler.gw.snapshot(Handler.gw_port))
+            else:
+                self._json({"enabled": False, "off": True})
         elif path == "/api/node":
             if Handler.node:
                 self._json(Handler.node.snapshot())
@@ -936,6 +1350,29 @@ class Handler(BaseHTTPRequestHandler):
                                 model_path=(payload.get("model_path") or "").strip(),
                                 context_len=(payload.get("context_len") or "").strip())
             self._json({"ok": True, "id": t.id})
+        elif path.startswith("/api/gateway/") and Handler.gw:
+            g = Handler.gw
+            if path == "/api/gateway/toggle":
+                g.enabled = not g.enabled
+                self._json({"ok": True, "enabled": g.enabled})
+            elif path == "/api/gateway/key":
+                k = g.gen_key(payload.get("name", ""), payload.get("rpm", 0),
+                              payload.get("quota_tokens", 0))
+                self._json({"ok": True, "key": k})
+            elif path == "/api/gateway/key/op":
+                ok = g.key_op(payload.get("key", ""), payload.get("op", ""),
+                              rpm=payload.get("rpm"), quota_tokens=payload.get("quota_tokens"))
+                self._json({"ok": ok})
+            elif path == "/api/gateway/channel":
+                ok = g.add_channel(payload.get("name", ""), payload.get("url", ""),
+                                   payload.get("api_key", ""), payload.get("priority", 1),
+                                   payload.get("weight", 10))
+                self._json({"ok": ok} if ok else {"ok": False, "error": "名称为空或已存在"})
+            elif path == "/api/gateway/channel/op":
+                ok = g.channel_op(payload.get("name", ""), payload.get("op", ""))
+                self._json({"ok": ok})
+            else:
+                self._json({"error": "not found"}, 404)
         elif path == "/api/targets/remove":
             Handler.reg.remove(payload.get("id") or "")
             self._json({"ok": True})
@@ -955,6 +1392,10 @@ def main():
     ap.add_argument("--history", type=int, default=DEFAULT_HISTORY)
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets.json"))
     ap.add_argument("--demo", action="store_true", help="内置仿真数据源（无真实服务时演示界面）")
+    ap.add_argument("--gw", action="store_true", help="启用 API 分发网关（/gw/v1/* OpenAI 兼容端点）")
+    ap.add_argument("--gw-port", type=int, default=8125, help="网关监听端口（默认 8125）")
+    ap.add_argument("--gw-config", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "gateway.json"), help="网关配置文件（渠道+Key+用量）")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
     try:
@@ -991,6 +1432,17 @@ def main():
             print("[target] %s = %s" % (name, url))
     reg.save()
 
+    if args.gw:
+        gw = Gateway(args.gw_config)
+        Handler.gw = gw
+        Handler.gw_port = args.gw_port
+        GatewayHandler.gw = gw
+        ghttpd = ThreadingHTTPServer((args.host, args.gw_port), GatewayHandler)
+        threading.Thread(target=ghttpd.serve_forever, daemon=True).start()
+        print("  网关:   http://%s:%d/gw/v1 （OpenAI 兼容；⚙ 菜单里管理 Key/渠道）"
+              % ("127.0.0.1" if args.host == "0.0.0.0" else args.host, args.gw_port))
+        print("         渠道 %d 个 / Key %d 把（%s）" % (len(gw.data["channels"]),
+              len(gw.data["keys"]), args.gw_config))
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print("=" * 62)
     print("  vLLM 推理监控大屏已启动  (v%s)" % VERSION)
@@ -1146,6 +1598,29 @@ canvas.chart{width:100%;height:100%;display:block}
   background:rgba(20,28,48,.8);color:var(--txt);font-size:13px;outline:none}
 .modal input:focus{border-color:var(--accent)}
 .modal .btns{display:flex;gap:10px;margin-top:20px;justify-content:flex-end}
+.modal.wide{width:920px;max-width:96vw;max-height:88vh;overflow:auto}
+.gwtop{display:flex;justify-content:space-between;align-items:center;font-size:13px;
+  padding:10px 12px;border:1px solid var(--panel-border);border-radius:10px;margin-bottom:10px}
+.gwbtns button{padding:6px 14px;border-radius:8px;border:1px solid rgba(130,160,255,.3);
+  background:transparent;color:var(--txt);cursor:pointer;font-size:12.5px}
+.gwbtns button:hover{border-color:var(--accent);color:var(--accent)}
+.gwstats{display:flex;gap:22px;font-size:12.5px;color:var(--dim);margin-bottom:14px}
+.gwstats b{color:var(--txt);font-size:15px;margin-right:4px}
+.gwh{font-size:13px;color:#aebfe6;margin:14px 0 6px;font-weight:600}
+.gwh .dim{font-weight:400;font-size:11px;color:var(--dim)}
+.gwtable{width:100%;border-collapse:collapse;font-size:12px}
+.gwtable th{color:var(--dim);font-weight:400;text-align:left;padding:4px 6px;
+  border-bottom:1px solid var(--panel-border);white-space:nowrap}
+.gwtable td{padding:5px 6px;border-bottom:1px solid rgba(130,160,255,.07);white-space:nowrap}
+.gwtable td.key{cursor:pointer;color:#9fb4e8}
+.gwtable td.key:hover{color:var(--accent)}
+.gwtable .op{color:#67e8f9;cursor:pointer;margin-right:2px}
+.gwtable .op:hover{text-decoration:underline}
+.gwform{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}
+.gwform input{padding:7px 10px;border-radius:8px;border:1px solid rgba(130,160,255,.25);
+  background:rgba(20,28,48,.8);color:var(--txt);font-size:12.5px;outline:none}
+.gwform button{padding:8px 16px;border-radius:8px;border:none;cursor:pointer;font-size:12.5px;
+  background:linear-gradient(92deg,#0891b2,#2563eb);color:#fff}
 .modal button{padding:8px 18px;border-radius:9px;border:none;cursor:pointer;font-size:13px}
 #mOk{background:linear-gradient(92deg,#0891b2,#2563eb);color:#fff}
 #mCancel{background:transparent;border:1px solid rgba(130,160,255,.3);color:var(--dim)}
@@ -1169,6 +1644,7 @@ canvas.chart{width:100%;height:100%;display:block}
       <div class="menu" id="gearMenu">
         <div class="mi" id="miAdd">＋ 添加监控目标</div>
         <div class="mi" id="miExport">⬇ 导出日志（CSV）</div>
+        <div class="mi" id="miGw">🔌 API 分发（网关）</div>
       </div>
     </div>
   </div>
@@ -1213,6 +1689,49 @@ canvas.chart{width:100%;height:100%;display:block}
     <div class="btns"><button id="mCancel">取消</button><button id="mOk">添加</button></div>
   </div>
 </div>
+<div class="modal-bg" id="gwModalBg">
+  <div class="modal wide">
+    <h3>API 分发（网关）</h3>
+    <div id="gwOff" style="display:none;color:#fda4af;font-size:13px;margin-bottom:10px">
+      网关未启动：用 <span class="mono">--gw</span> 参数启动大屏后可用（如 <span class="mono">python vllm_dashboard.py --gw</span>）
+    </div>
+    <div id="gwBody">
+      <div class="gwtop">
+        <div>状态：<b id="gwState">—</b>　端口：<span class="mono" id="gwPort">—</span>　接入地址：<span class="mono" id="gwBase">—</span></div>
+        <div class="gwbtns">
+          <button id="gwToggleBtn">暂停转发</button>
+          <button id="gwCloseBtn" style="margin-left:8px">关闭</button>
+        </div>
+      </div>
+      <div class="gwstats" id="gwStats"></div>
+
+      <h4 class="gwh">上游渠道 <span class="dim">（vLLM 服务；按优先级路由，连接失败自动转移）</span></h4>
+      <table class="gwtable" id="gwChanT"><thead><tr>
+        <th>名称</th><th>地址</th><th>优先级/权重</th><th>状态</th><th>请求/失败</th><th>token</th><th>均延迟</th><th>操作</th>
+      </tr></thead><tbody></tbody></table>
+      <div class="gwform" id="gwChanForm">
+        <input id="gcName" placeholder="名称（如 prod-1）" style="width:120px">
+        <input id="gcUrl" placeholder="http://127.0.0.1:8123" style="width:200px">
+        <input id="gcKey" placeholder="上游Key(可空)" style="width:110px">
+        <input id="gcPri" placeholder="优先级1" style="width:80px" value="1">
+        <input id="gcWt" placeholder="权重10" style="width:80px" value="10">
+        <button id="gcAdd">＋ 添加渠道</button>
+      </div>
+
+      <h4 class="gwh">接入 Key <span class="dim">（生成后发给同事：接入地址 + Key + 模型名）</span></h4>
+      <table class="gwtable" id="gwKeyT"><thead><tr>
+        <th>名称</th><th>Key（点击复制）</th><th>RPM 限</th><th>配额/已用 token</th><th>请求</th><th>状态</th><th>操作</th>
+      </tr></thead><tbody></tbody></table>
+      <div class="gwform" id="gwKeyForm">
+        <input id="gkName" placeholder="Key 名称（如 张三）" style="width:150px">
+        <input id="gkRpm" placeholder="RPM 限额（0=不限）" style="width:150px">
+        <input id="gkQuota" placeholder="token 配额（0=不限）" style="width:160px">
+        <button id="gkGen">＋ 生成 Key</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="tip" id="tip"></div>
 
 <script>
@@ -1514,6 +2033,151 @@ document.addEventListener("click",e=>{
 $("miAdd").onclick=()=>{gearMenu.style.display="none";$("mErr").textContent="";
   $("modalBg").style.display="flex";$("mName").focus();};
 $("miExport").onclick=()=>{gearMenu.style.display="none";doExport();};
+$("miGw").onclick=()=>{gearMenu.style.display="none";gwOpen();};
+$("gwCloseBtn").onclick=gwClose;
+$("gwModalBg").onclick=e=>{if(e.target===$("gwModalBg"))gwClose();};
+$("gwToggleBtn").onclick=async()=>{const j=await gwPost("/api/gateway/toggle");if(j.ok)gwPoll();};
+$("gcAdd").onclick=async()=>{
+  const j=await gwPost("/api/gateway/channel",{name:$("gcName").value.trim(),
+    url:$("gcUrl").value.trim(),api_key:$("gcKey").value.trim(),
+    priority:parseInt($("gcPri").value||"1"),weight:parseInt($("gcWt").value||"10")});
+  if(j.ok){$("gcName").value=$("gcUrl").value=$("gcKey").value="";toast("渠道已添加");gwPoll();}
+  else toast(j.error||"添加失败");};
+$("gkGen").onclick=async()=>{
+  const j=await gwPost("/api/gateway/key",{name:$("gkName").value.trim(),
+    rpm:parseInt($("gkRpm").value||"0")||0,quota_tokens:parseInt($("gkQuota").value||"0")||0});
+  if(j.ok){$("gkName").value=$("gkRpm").value=$("gkQuota").value="";
+    gwPoll();setTimeout(()=>{
+      copyText(gwAccessSnippet(j.key),"Key 已生成，接入信息已复制，直接发给同事即可");
+    },400);}
+  else toast("生成失败");};
+$("gwChanT").onclick=async e=>{
+  const a=e.target.closest("a.op");if(!a)return;
+  const j=await gwPost("/api/gateway/channel/op",{name:a.dataset.n,op:a.dataset.op});
+  if(j.ok)gwPoll();};
+$("gwKeyT").onclick=async e=>{
+  const td=e.target.closest("td.key");
+  if(td){copyText(td.textContent.trim(),"Key 已复制");return;}
+  const a=e.target.closest("a.kop");if(!a)return;
+  if(a.dataset.op==="access"){copyText(gwAccessSnippet(a.dataset.k),"接入信息已复制");return;}
+  if(a.dataset.op==="delete"&&!confirm("删除该 Key？"))return;
+  const j=await gwPost("/api/gateway/key/op",{key:a.dataset.k,op:a.dataset.op});
+  if(j.ok)gwPoll();};
+
+/* ---------------- API 分发网关面板 ---------------- */
+let gwData=null, gwTimer=null;
+
+function gwOpen(){
+  $("gwModalBg").style.display="flex";
+  gwPoll();
+  if(gwTimer)clearInterval(gwTimer);
+  gwTimer=setInterval(()=>{if($("gwModalBg").style.display==="flex")gwPoll();},4000);
+}
+function gwClose(){
+  $("gwModalBg").style.display="none";
+  if(gwTimer){clearInterval(gwTimer);gwTimer=null;}
+}
+async function gwPoll(){
+  try{const r=await fetch("/api/gateway");gwData=await r.json();gwRender();}catch(e){}
+}
+function gwModelName(){
+  const mi=(data&&data.meta_info)||{};
+  return (mi.model_ids&&mi.model_ids[0])||"deepseek-v4.1-flash";
+}
+function gwAccessSnippet(key){
+  const base="http://"+location.hostname+":"+gwData.port+"/gw/v1";
+  const m=gwModelName();
+  return "接入地址: "+base+"\nAPI Key:  "+key+"\n模型名:   "+m+"\n\n"
+    +'curl '+base+'/chat/completions \\\n'
+    +'  -H "Authorization: Bearer '+key+'" -H "Content-Type: application/json" \\\n'
+    +"  -d '{\"model\":\""+m+"\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'\n\n"
+    +"# Python (openai SDK)\n"
+    +"from openai import OpenAI\n"
+    +'client = OpenAI(base_url="'+base+'", api_key="'+key+'")\n'
+    +'print(client.chat.completions.create(model="'+m+'",\n'
+    +'    messages=[{"role":"user","content":"你好"}]).choices[0].message.content)';
+}
+function copyText(t,tip){
+  tip=tip||"已复制";
+  const done=()=>toast(tip);
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(done).catch(()=>fallbackCopy(t,done));return;}
+  fallbackCopy(t,done);
+}
+function fallbackCopy(t,done){
+  const ta=document.createElement("textarea");ta.value=t;
+  ta.style.position="fixed";ta.style.opacity="0";
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand("copy");done();}catch(e){toast("复制失败，请手动复制");}
+  document.body.removeChild(ta);
+}
+let toastTimer=null;
+function toast(msg){
+  let el=$("toastTip");
+  if(!el){el=document.createElement("div");el.id="toastTip";
+    el.style.cssText="position:fixed;bottom:28px;left:50%;transform:translateX(-50%);"+
+      "background:rgba(13,20,40,.95);border:1px solid rgba(34,211,238,.4);color:#aef3ff;"+
+      "padding:9px 18px;border-radius:10px;font-size:13px;z-index:200;pointer-events:none";
+    document.body.appendChild(el);}
+  el.textContent=msg;el.style.display="block";
+  if(toastTimer)clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>{el.style.display="none";},1800);
+}
+function gwRender(){
+  const g=gwData;if(!g)return;
+  if(g.off){$("gwOff").style.display="block";$("gwBody").style.display="none";return;}
+  $("gwOff").style.display="none";$("gwBody").style.display="block";
+  const st=$("gwState");
+  st.textContent=g.enabled?"转发中 ✓":"已暂停";
+  st.style.color=g.enabled?"#6ee7b7":"#fda4af";
+  $("gwPort").textContent=g.port;
+  $("gwBase").textContent="http://"+location.hostname+":"+g.port+"/gw/v1";
+  $("gwToggleBtn").textContent=g.enabled?"⏸ 暂停转发":"▶ 开启转发";
+  const t=g.totals;
+  $("gwStats").innerHTML=
+    '<span class="gs"><b>'+t.requests+'</b> 总请求</span>'
+    +'<span class="gs"><b>'+t.ok+'</b> 成功</span>'
+    +'<span class="gs"><b>'+t.fail+'</b> 失败</span>'
+    +'<span class="gs"><b>'+fmtTok(t.tokens)+'</b> token</span>';
+  // 渠道表
+  const tb=$("gwChanT").querySelector("tbody");tb.innerHTML="";
+  for(const c of g.channels){
+    const stTxt={ok:"<span style='color:#6ee7b7'>正常</span>",
+                 paused:"<span style='color:#fcd34d'>已停用</span>",
+                 broken:"<span style='color:#fda4af'>熔断 "+c.broken_until+"s</span>"}[c.status];
+    const tr=document.createElement("tr");
+    tr.innerHTML='<td>'+esc(c.name)+'</td><td class="mono">'+esc(c.base_url)+'</td>'
+      +'<td>'+c.priority+' / '+c.weight+'</td><td>'+stTxt+'</td>'
+      +'<td>'+c.requests+' / '+(c.fail||0)+'</td><td>'+fmtTok(c.tokens)+'</td>'
+      +'<td>'+(c.avg_latency_ms||0)+'ms</td>'
+      +'<td><a class="op" data-op="toggle" data-n="'+esc(c.name)+'">'+(c.status==="paused"?"启用":"停用")+'</a> '
+      +'<a class="op" data-op="delete" data-n="'+esc(c.name)+'">删除</a></td>';
+    tb.appendChild(tr);
+  }
+  // Key 表
+  const kb=$("gwKeyT").querySelector("tbody");kb.innerHTML="";
+  for(const k of g.keys){
+    const quota=k.quota_tokens?fmtTok(k.quota_tokens):"不限";
+    const used=k.quota_tokens&&k.used_tokens>=k.quota_tokens?"（已超）":"";
+    const tr=document.createElement("tr");
+    tr.innerHTML='<td>'+esc(k.name)+'</td>'
+      +'<td class="mono key" title="点击复制 Key">'+esc(k.key)+'</td>'
+      +'<td>'+(k.rpm||"不限")+'</td>'
+      +'<td>'+quota+' / '+fmtTok(k.used_tokens)+used+'</td>'
+      +'<td>'+k.used_requests+'</td>'
+      +'<td>'+(k.enabled?"<span style='color:#6ee7b7'>启用</span>":"<span style='color:#fda4af'>停用</span>")+'</td>'
+      +'<td><a class="op kop" data-op="access" data-k="'+esc(k.key)+'">复制接入</a> '
+      +'<a class="op kop" data-op="toggle" data-k="'+esc(k.key)+'">'+(k.enabled?"停用":"启用")+'</a> '
+      +'<a class="op kop" data-op="delete" data-k="'+esc(k.key)+'">删除</a></td>';
+    kb.appendChild(tr);
+  }
+}
+async function gwPost(path,body){
+  try{const r=await fetch(path,{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+    return await r.json();}catch(e){return {error:String(e)};}
+}
+
 
 function doExport(){
   if(!data||!data.series||!data.series.t||!data.series.t.length){alert("当前无数据可导出");return;}
