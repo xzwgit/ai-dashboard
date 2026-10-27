@@ -1486,6 +1486,126 @@ class GatewayHandler(BaseHTTPRequestHandler):
 HTML = None  # 见文件底部 _build_html()
 
 
+CONFIG_EXAMPLE = {
+    "targets": [
+        {"name": "svc-a", "url": "http://10.0.0.1:8123", "api_key": "",
+         "model_path": "/data/models/Your-Model-A", "context_len": "1048576"},
+        {"name": "svc-b", "url": "http://10.0.0.2:8123", "api_key": "",
+         "model_path": "/data/models/Your-Model-B", "context_len": "1048576"},
+    ],
+    "gateway": {
+        "policy": "round_robin",
+        "channels": [
+            {"name": "a", "url": "http://10.0.0.1:8123", "api_key": "", "priority": 1, "weight": 10},
+            {"name": "b", "url": "http://10.0.0.2:8123", "api_key": "", "priority": 1, "weight": 10},
+        ],
+    },
+}
+
+AGENT_MD = """# ai-dashboard 配置编写指南（给 AI agent）
+
+大屏（AI 推理性能监控大屏）支持一键导入一份 JSON 配置，完成监控目标与网关渠道的初始化。
+入口：页面 ⚙ 菜单 →「⬆ 导入配置」，或 POST /api/config/import（body: {"config": <下方结构>}）。
+
+## 配置结构
+
+```json
+{
+  "targets": [
+    {"name": "svc-a", "url": "http://10.0.0.1:8123", "api_key": "",
+     "model_path": "/data/models/Your-Model-A", "context_len": "1048576"}
+  ],
+  "gateway": {
+    "policy": "round_robin",
+    "channels": [
+      {"name": "a", "url": "http://10.0.0.1:8123", "api_key": "", "priority": 1, "weight": 10}
+    ]
+  }
+}
+```
+
+## 字段说明
+
+- targets[]（监控目标，即每个 AI 推理服务）
+  - name：显示名（页签/AI服务详情/服务器列表里的名字），必填、唯一
+  - url：vLLM 服务根地址（OpenAI 端口；大屏自动拼 /metrics 抓指标），必填，http(s)://host:port
+  - api_key：该服务 /metrics 需要 Bearer 时填（vLLM 的 /metrics 通常匿名，留空即可）
+  - model_path：权重目录完整路径——**建议填**：AI服务详情表的「模型」列显示的是该路径的最后一段全名
+  - context_len：上下文长度（显示用，字符串或数字）
+- gateway（API 分发网关，--gw 启动时生效）
+  - policy：负载均衡策略，五选一：weight（加权随机）/ round_robin（轮询）/ p2c（二选一）/ least_requests（最少负载）/ session（会话亲和，多轮对话保前缀缓存，推荐对话类负载）
+  - channels[]：上游渠道（即各推理服务）
+    - name：渠道名，必填、唯一；url：同 targets.url；api_key：转发时携带的上游 Bearer（无鉴权留空）
+    - priority：数字越小越优先；同优先级内按 policy 分流，高优先级整体不可用时自动落到低优先级（灾备用）
+    - weight：同优先级内的权重比例（weight 策略下生效）
+
+## 语义与注意
+
+- 导入为**整体替换**：现有 targets 与 channels 会被清空后按本文件重建；网关已生成的客户端 Key（sk-…）不受影响
+- secrets 口径：targets/channels 的 api_key 会随「导出配置」一并导出（内网服务凭据）；客户端 Key 永不导出
+- 同机多服务：每台引擎机如在 :8124 跑一个同款大屏实例，主屏「服务器列表」会自动接入该机 CPU/GPU/内存简况
+- 示例可直接 GET /api/config/example 获取；当前配置可 GET /api/config/export 导出
+
+## 生成后自检清单
+
+1. 每个 url 可达（curl <url>/health 返回 200）
+2. channels 与 targets 的 url 通常一一对应（同名同址）；灾备场景才用不同 priority 分层
+3. policy 按负载类型选：多轮对话=session；一次性高并发短输出=round_robin/least_requests；混合=weight
+"""
+
+
+def build_config_export(reg, gw):
+    """导出当前配置（targets + 网关策略/渠道；不含客户端 Key）。"""
+    with reg.lock:
+        targets = [{"name": t.name, "url": t.url, "api_key": t.api_key,
+                    "model_path": t.model_path, "context_len": t.context_len}
+                   for t in reg.targets]
+    out = {"targets": targets, "gateway": {"policy": "weight", "channels": []}}
+    if gw is not None:
+        with gw.lock:
+            out["gateway"] = {
+                "policy": gw.data.get("policy", "weight"),
+                "channels": [{"name": c["name"], "url": c["base_url"], "api_key": c.get("api_key", ""),
+                              "priority": c.get("priority", 1), "weight": c.get("weight", 10)}
+                             for c in gw.data["channels"]],
+            }
+    return out
+
+
+def apply_config_import(reg, gw, cfg):
+    """整体替换 targets 与渠道/策略；返回 (ok, 摘要)。客户端 Key 保留。"""
+    try:
+        tlist = cfg.get("targets") or []
+        gcfg = cfg.get("gateway") or {}
+        for t in list(reg.targets):   # remove() 自带锁（非重入锁，勿外包 reg.lock 否则死锁）
+            reg.remove(t.id)
+        for it in tlist:
+            reg.add((it.get("name") or "target").strip(), (it.get("url") or "").strip(),
+                    it.get("api_key") or "", model_path=(it.get("model_path") or "").strip(),
+                    context_len=str(it.get("context_len") or ""))
+        reg.save()
+        if gw is not None and gcfg:
+            with gw.lock:
+                gw.data["policy"] = gcfg.get("policy") if gcfg.get("policy") in GW_LB_POLICIES else "weight"
+                gw.data["channels"] = []
+                for c in (gcfg.get("channels") or []):
+                    url = (c.get("url") or "").strip().rstrip("/")
+                    if not url:
+                        continue
+                    gw.data["channels"].append({
+                        "name": (c.get("name") or "ch").strip(), "base_url": url,
+                        "api_key": c.get("api_key") or "",
+                        "priority": int(c.get("priority") or 1),
+                        "weight": max(1, int(c.get("weight") or 10)), "enabled": True})
+                gw.chan = {c["name"]: gw._blank_chan() for c in gw.data["channels"]}
+                gw.reqwin, gw.aff = {}, {}
+                gw.save()
+        nch = len(gw.data["channels"]) if gw is not None else 0
+        return True, "导入完成：%d 个监控目标，%d 个渠道" % (len(tlist), nch)
+    except Exception as e:
+        return False, "导入失败：%s" % e
+
+
 class Handler(BaseHTTPRequestHandler):
     reg = None       # type: Registry
     demos = []       # type: list  仿真引擎列表（demo 模式）
@@ -1521,6 +1641,18 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": t.id, "name": t.name, "url": t.url, "status": t.status,
                  "last_error": t.last_error, "last_ts": t.last_ts}
                 for t in Handler.reg.targets]})
+        elif path == "/api/config/export":
+            self._json(build_config_export(Handler.reg, Handler.gw))
+        elif path == "/api/config/example":
+            self._json(CONFIG_EXAMPLE)
+        elif path == "/agent.md":
+            body = AGENT_MD.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="agent.md"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif path == "/api/overview":
             rows = []
             tot = {"gen_rate": 0.0, "prompt_rate": 0.0, "running": 0, "waiting": 0,
@@ -1642,6 +1774,13 @@ class Handler(BaseHTTPRequestHandler):
                                 context_len=(payload.get("context_len") or "").strip())
             wire_local_node(t)
             self._json({"ok": True, "id": t.id})
+        elif path == "/api/config/import":
+            cfg = payload.get("config")
+            if not isinstance(cfg, dict) or "targets" not in cfg:
+                self._json({"error": "config 需要 {targets:[...], gateway:{...}} 结构"}, 400)
+                return
+            ok, msg = apply_config_import(Handler.reg, Handler.gw, cfg)
+            self._json({"ok": ok, "message": msg}, 200 if ok else 400)
         elif path.startswith("/api/gateway/") and Handler.gw:
             g = Handler.gw
             if path == "/api/gateway/toggle":
@@ -1999,6 +2138,11 @@ canvas.chart{width:100%;height:100%;display:block}
         <div class="mi" id="miAdd">＋ 添加监控目标</div>
         <div class="mi" id="miExport">⬇ 导出日志（CSV）</div>
         <div class="mi" id="miGw">🔌 API 分发（网关）</div>
+        <div class="mi" id="miCfgExport">⬇ 导出配置（当前）</div>
+        <div class="mi" id="miCfgExample">⬇ 导出示例配置</div>
+        <div class="mi" id="miCfgImport">⬆ 导入配置</div>
+        <div class="mi" id="miAgentMd">⬇ 下载 agent.md</div>
+        <input type="file" id="cfgFile" accept=".json,application/json" style="display:none">
         <div class="mver" title="当前运行的版本">v__APPVER__</div>
       </div>
     </div>
@@ -2592,6 +2736,31 @@ $("miAdd").onclick=()=>{gearMenu.style.display="none";$("mErr").textContent="";
   $("modalBg").style.display="flex";$("mName").focus();};
 $("miExport").onclick=()=>{gearMenu.style.display="none";doExport();};
 $("miGw").onclick=()=>{gearMenu.style.display="none";gwOpen();};
+function dlText(name,text,mime){
+  const blob=new Blob([text],{type:mime||"application/json;charset=utf-8"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+async function dlApi(path,name,mime){
+  try{const r=await fetch(path);const t=await r.text();dlText(name,t,mime);toast(name+" 已下载");}
+  catch(e){toast("下载失败:"+e);}
+}
+$("miCfgExport").onclick=()=>{gearMenu.style.display="none";dlApi("/api/config/export","ai-dashboard-config.json");};
+$("miCfgExample").onclick=()=>{gearMenu.style.display="none";dlApi("/api/config/example","ai-dashboard-config-example.json");};
+$("miAgentMd").onclick=()=>{gearMenu.style.display="none";dlApi("/agent.md","agent.md","text/markdown;charset=utf-8");};
+$("miCfgImport").onclick=()=>{gearMenu.style.display="none";$("cfgFile").value="";$("cfgFile").click();};
+$("cfgFile").onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  try{
+    const cfg=JSON.parse(await f.text());
+    if(!confirm("导入将整体替换现有监控目标与网关渠道（客户端 Key 保留），确认？"))return;
+    const r=await fetch("/api/config/import",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg})});
+    const j=await r.json();
+    toast(j.message||("导入"+(j.ok?"成功":"失败")));
+    if(j.ok){pollTargets();setTimeout(pollData,400);}
+  }catch(err){toast("导入失败：JSON 解析错误 "+err.message.slice(0,60));}
+};
 $("gwCloseX").onclick=gwClose;
 $("gwModalBg").onclick=e=>{if(e.target===$("gwModalBg"))gwClose();};
 $("gwToggleBtn").onclick=async()=>{const j=await gwPost("/api/gateway/toggle");if(j.ok)gwPoll();};
