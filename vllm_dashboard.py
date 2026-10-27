@@ -1771,9 +1771,11 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .tab .led{width:8px;height:8px;border-radius:50%;background:#555}
 .tab .led.up{background:var(--green);box-shadow:0 0 8px var(--green)}
 .tab .led.down{background:var(--rose);box-shadow:0 0 8px var(--rose)}
-.ovtbl{width:100%;border-collapse:collapse;font-size:12px}
-.ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 5px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px}
-.ovtbl td{padding:2px 5px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35}
+.ovtbl{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px}
+.ovtbl th:nth-child(2){width:92px}
+.ovtbl th:nth-child(11){width:168px}
+.ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 5px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px;overflow:hidden;text-overflow:ellipsis}
+.ovtbl td{padding:2px 5px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35;overflow:hidden;text-overflow:ellipsis}
 #ovmachCard{padding:8px 10px 6px}
 .ovtbl tr.ovrow{cursor:pointer}
 .ovtbl tr.ovrow:hover{background:rgba(34,211,238,.06)}
