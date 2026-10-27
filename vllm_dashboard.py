@@ -1943,7 +1943,7 @@ canvas.chart{width:100%;height:100%;display:block}
     </div>
     </div>
     <div class="ovR">
-      <div class="card"><h4>服务器列表（引擎 · 简况）</h4><div id="ovNodes"></div></div>
+      <div class="card"><h4>服务器列表</h4><div id="ovNodes"></div></div>
     </div>
     </div>
     <div class="info">
