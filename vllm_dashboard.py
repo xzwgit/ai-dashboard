@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""vLLM 推理监控大屏 —— 单文件、纯标准库、Prometheus /metrics 抓取 + 现代化 Web 大屏。
-
-定位：替代 Prometheus+Grafana 看板里最常用的 vLLM 应用层指标（decode 速度 / KV cache 容量 /
-并发 / TTFT / TPOT / 投机解码接受率 / 前缀缓存命中 / 抢占），界面为中文大屏风格。
+"""vLLM 推理监控大屏 —— Prometheus /metrics 抓取 + Web 大屏 + API 分发网关（单文件纯标准库）。
 
 用法:
   # 监控一个 vLLM 服务（服务端口即 OpenAI 端口，/metrics 自动拼接）:
@@ -44,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "3.3.0"    # v3.3：主屏两栏（右列服务器列表通栏+宿主机简况：CPU/GPU/内存/系统/运行时间，引擎机跑同款实例自动接入）；v3.2：右侧列表；v3.1.1：主屏更名；v3.1：固定主屏
+VERSION = "2.0.0"    # v2：监控 + API 分发网关 + 负载均衡 + 主屏（全场合计/服务器列表）；v1 纯监控见 vllm_dashboard_v1.py
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）

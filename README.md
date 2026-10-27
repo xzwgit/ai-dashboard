@@ -1,7 +1,5 @@
 # vllm-dashboard — vLLM 推理监控大屏
 
-> 单文件、纯 Python 标准库的 vLLM 应用层监控大屏（Prometheus /metrics 抓取 → 中文现代大屏），2026-10-24 建。
-> 定位：替代 Prometheus+Grafana 组合里最常用的那部分 vLLM 指标看板，零依赖、本地或服务器直跑。
 
 ## 界面结构（2026-10-24 终版）
 
@@ -18,7 +16,7 @@
 | 模块 | 功能 | 说明 |
 |---|---|---|
 | **监控接入** | 多目标监控 | 页签切换、页面随时增删，配置持久化 targets.json；vLLM 新旧指标名自动兼容（0.32.0 实测对齐） |
-| | **主屏（v3.1+，固定第一页签）** | 全场合计大屏：机器在线数 / Decode・Prefill 合计 / 运行+排队 / KV 最高（标机器）/ TPOT p95 均值 / 全场累计 7 卡 + 合计曲线 ×3 + 各机累计 Decode 对比 + 机器明细通栏表（Decode/Prefill/运行排队/KV/TPOT/缓存命中/投机接受率/累计生成/模型/上下文/版本，点击行切到该机）+ 右列服务器列表（纯硬件简况：CPU/GPU/内存/系统/运行时长；引擎机跑同款实例自动接入） |
+| | **主屏（固定第一页签）** | 全场合计大屏：机器在线数 / Decode・Prefill 合计 / 运行+排队 / KV 最高（标机器）/ TPOT p95 均值 / 全场累计 7 卡 + 合计曲线 ×3 + 各机累计 Decode 对比 + 机器明细通栏表（Decode/Prefill/运行排队/KV/TPOT/缓存命中/投机接受率/累计生成/模型/上下文/版本，点击行切到该机）+ 右列服务器列表（纯硬件简况：CPU/GPU/内存/系统/运行时长；引擎机跑同款实例自动接入） |
 | | 指标抓取 | /metrics 2 秒轮询，内存滚动保留约 3 小时；计数器重启自动识别不回负 |
 | | 鉴权 | 目标可单独配 Bearer Key；/metrics 匿名时留空即可 |
 | | 失败诊断 | 抓取失败按原因报人话：服务未启动/端口不对、鉴权失败(401/403)、路径不对(404)、超时、域名错；附原始错误摘要 |
@@ -38,10 +36,10 @@
 | **模型/接入** | 模型卡 | 模型 ID（自动抓 /v1/models）、vLLM 版本（自动抓 /version）、上下文长度、权重路径、接入地址（127.0.0.1 自动替换为实际访问 IP）、API Key——客户端接入信息一眼可抄 |
 | **工具** | ⚙ 设置菜单 | 添加监控目标 / 导出日志 |
 | | 导出日志 | 当前目标全部序列一键 CSV（带 BOM，Excel 直开；含目标信息与口径注释头） |
-| **API 分发网关（v2+）** | OpenAI 兼容反代 | `--gw` 启用，`/gw/v1/*` 端点；多渠道优先级+权重路由、连接类失败自动转移、SSE 流式逐 chunk 透传（自动注入 include_usage 拿准确用量） |
+| **API 分发网关** | OpenAI 兼容反代 | `--gw` 启用，`/gw/v1/*` 端点；多渠道优先级+权重路由、连接类失败自动转移、SSE 流式逐 chunk 透传（自动注入 include_usage 拿准确用量） |
 | | Key 管理（UI） | ⚙ → API 分发：一键生成 sk- Key / 命名 / RPM+token 配额 / 启停 / 删除；「复制接入」出 curl+Python SDK 现成接入片段 |
 | | 限流与记账 | Key 级 401/403/429；token 记账与引擎 usage 精确对账；渠道级 3 连败熔断 60s；网关统计（请求/成功/失败/token/均延迟） |
-| **负载均衡（v3）** | 策略分流 | 四种策略同优先级层内分流：加权随机 / 轮询 / P2C 二选一（比在途请求数）/ 最少负载（按引擎运行请求数，监控指标感知）；跨优先级层自动故障转移 |
+| **负载均衡** | 策略分流 | 四种策略同优先级层内分流：加权随机 / 轮询 / P2C 二选一（比在途请求数）/ 最少负载（按引擎运行请求数，监控指标感知）；跨优先级层自动故障转移 |
 | | 主动探活 | 渠道每 10s GET /health；探活失败的渠道自动摘除（不再被路由命中），全挂时不雪崩 |
 | | 负载均衡总表 | 渠道 × 引擎实时一张表：状态 / 探活延迟 / 在途 / 请求失败 / QPS(1m) / token / 均延迟 + 引擎侧运行/排队/KV/Decode tok/s（渠道地址与监控目标一致时自动联动）+ 合计行 |
 | **部署特性** | 单文件零依赖 | 纯 Python 标准库，本地/服务器一条命令起；`--demo` 内置仿真数据源可无服务预览；页面隐藏自动暂停轮询 |
@@ -51,11 +49,9 @@
 在目标机器（Linux，需 curl 或 wget）上选版本安装：
 
 ```bash
-# 一键式：装 v3（监控 + 网关负载均衡 + 负载均衡总表）
-curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v3
-# 装 v2（监控 + API 分发网关）
+# 一键式：装 v2（监控 + API 网关 + 负载均衡 + 主屏） / v1（纯监控大屏）
 curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v2
-# 装 v1（纯监控大屏）
+curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v1
 curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v1
 # 或先落脚本再装（第二参数=安装目录）
 curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh
@@ -63,7 +59,7 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/vllm-dashboard
 ./install.sh list      # 列出仓库已发布的版本 tag
 ```
 
-- **版本来源**：`v1` / `v2` 优先取 git tag（`v1.0.0` / `v2.0.0`，历史版本固定不变）；tag 不可达时自动回退 master（v1 = 冻结副本 `vllm_dashboard_v1.py`，v2 = 主文件）；`latest` = master 开发版；也支持 `./install.sh v2.0.1` 直装指定 tag。
+- **版本来源**：`v1` / `v2` 取 git tag（历史版本固定不变）；tag 不可达时自动回退 master（v1 = 冻结副本 `vllm_dashboard_v1.py`，v2 = 主文件）；`latest` = master 开发版；也支持 `./install.sh vX.Y.Z` 直装指定 tag。
 - **raw 被墙自动兜底**：raw.githubusercontent.com 不可达的网络（国内常见）会自动改走 api.github.com 取文件（base64 解码，无需配置；需目标机有 python3）。
 - 下载后校验 `VERSION` 常量（防代理/网关返回错误页）；覆盖旧文件前自动备份 `.bak.<旧版本>.<时间戳>`；装完按版本打印下一步启动命令。
 - GitHub 直连不通的机器：`VD_PROXY=https://mirror.ghproxy.com ./install.sh v2`（raw 地址加镜像前缀）。
@@ -116,15 +112,11 @@ python vllm_dashboard.py --demo
 - v1（纯监控）与 v2（监控+网关）同仓按版本安装，互不覆盖
 
 ## 版本记录
-
 | 版本 | 日期 | 内容 |
 |---|---|---|
-| v1.0.0 | 2026-10-26 | 定版：监控大屏基础功能（多目标抓取/11 张 vLLM 指标卡/5 图/服务器信息/模型接入卡/CSV 导出/失败诊断）。冻结副本 `vllm_dashboard_v1.py` |
-| v2.0.0 | 2026-10-26 | **内置轻量网关交付**（M1+M2+M3 一次完成）：--gw 启用；/gw/v1/* OpenAI 兼容反代+渠道路由故障转移+SSE 透传；Key 生成/配额/RPM/记账（UI）；熔断；⚙ 面板。mock 全链路 10/10 + 真机 vLLM（流式/记账对账 token 精确一致）+ v1 监控回归全过 |
-| v3.1.1 | 2026-10-27 | 固定第一页签更名：「总览」→「主屏」 |
-| v3.3.0 | 2026-10-27 | **主屏大版**（12 项迭代合并发布）：主屏两栏布局（图表左列+右列服务器列表通栏等高底色）；简况卡=纯硬件信息（CPU 型号/核数/%、GPU 型号×N/%、内存、系统、运行时长；宿主信息源=本机进程内采集、远程引擎机跑同款实例 :8124 自动接入）；机器明细 13 列固定布局（缓存命中/接受率/模型/上下文/版本独立列，模型名取权重路径全名）；整体左对齐+紧凑化 |
-| v3.1.0 | 2026-10-27 | **固定总览页签**（第一个屏=全场大屏：几台机+全场合计；固定不可删，其余机器页签可增删）：合计卡×6 + 合计曲线×3 + 各机累计对比 + 机器明细表（点击跳转）+ 网关状态行 |
-| v3.0.0 | 2026-10-27 | **网关负载均衡 + 负载均衡总表**：四种策略（加权随机/轮询/P2C/最少负载-引擎指标感知，vllm-router 同款策略族）；主动探活（10s /health，失败自动摘除）；在途请求计数；QPS 窗口；总表=渠道×引擎实时一张表（探活/在途/QPS/token/引擎运行/KV/Decode+合计行）。本地双 mock 17/17 + 双机真机验证（轮询精确分流、探活 10s 摘除、故障转移 6/6） |
+| v1.0.0 | 2026-10-26 | 纯监控大屏：多目标抓取 / 11 张 vLLM 指标卡 / 5 图 / 服务器信息 / 模型接入卡 / CSV 导出 / 失败诊断 |
+| v2.0.0 | 2026-10-27 | **监控 + 网关 + 负载均衡 + 主屏**：API 分发网关（OpenAI 兼容反代 / Key 管理 / 记账 / 熔断）；负载均衡（四种策略 / 主动探活 / 故障转移 / 负载均衡总表）；主屏（固定第一页签：全场合计卡 ×7 + 合计曲线 + 各机对比 + 机器明细 13 列 + 右列服务器列表纯硬件简况）；选版本安装脚本（raw 被墙自动走 GitHub API 兜底） |
+
 
 ## 已知事项
 
