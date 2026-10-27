@@ -16,7 +16,7 @@
 | 模块 | 功能 | 说明 |
 |---|---|---|
 | **监控接入** | 多目标监控 | 页签切换、页面随时增删，配置持久化 targets.json；vLLM 新旧指标名自动兼容（0.32.0 实测对齐） |
-| | **主屏（固定第一页签）** | 全场合计大屏：机器在线数 / Decode・Prefill 合计 / 运行+排队 / KV 最高（标机器）/ TPOT p95 均值 / 全场累计 7 卡 + 合计曲线 ×3 + 各机累计 Decode 对比 + 机器明细通栏表（Decode/Prefill/运行排队/KV/TPOT/缓存命中/投机接受率/累计生成/模型/上下文/版本，点击行切到该机）+ 右列服务器列表（纯硬件简况：CPU/GPU/内存/系统/运行时长；引擎机跑同款实例自动接入） |
+| | **主屏（固定第一页签）** | **固定第一页签不可移除**：机器数（N 台在线/离线名单）、Decode/Prefill 合计吞吐、运行+排队合计、KV 最高（标机器）、TPOT p95 均值 6 卡 + 合计曲线 3 张（Decode/Prefill/并发）+ 各机累计 Decode 对比 1 张 + 机器明细表（点击行切换到该机大屏）+ 全场累计卡 |
 | | 指标抓取 | /metrics 2 秒轮询，内存滚动保留约 3 小时；计数器重启自动识别不回负 |
 | | 鉴权 | 目标可单独配 Bearer Key；/metrics 匿名时留空即可 |
 | | 失败诊断 | 抓取失败按原因报人话：服务未启动/端口不对、鉴权失败(401/403)、路径不对(404)、超时、域名错；附原始错误摘要 |
@@ -39,19 +39,18 @@
 | **API 分发网关** | OpenAI 兼容反代 | `--gw` 启用，`/gw/v1/*` 端点；多渠道优先级+权重路由、连接类失败自动转移、SSE 流式逐 chunk 透传（自动注入 include_usage 拿准确用量） |
 | | Key 管理（UI） | ⚙ → API 分发：一键生成 sk- Key / 命名 / RPM+token 配额 / 启停 / 删除；「复制接入」出 curl+Python SDK 现成接入片段 |
 | | 限流与记账 | Key 级 401/403/429；token 记账与引擎 usage 精确对账；渠道级 3 连败熔断 60s；网关统计（请求/成功/失败/token/均延迟） |
-| **负载均衡** | 策略分流 | 四种策略同优先级层内分流：加权随机 / 轮询 / P2C 二选一（比在途请求数）/ 最少负载（按引擎运行请求数，监控指标感知）；跨优先级层自动故障转移 |
-| | 主动探活 | 渠道每 10s GET /health；探活失败的渠道自动摘除（不再被路由命中），全挂时不雪崩 |
-| | 负载均衡总表 | 渠道 × 引擎实时一张表：状态 / 探活延迟 / 在途 / 请求失败 / QPS(1m) / token / 均延迟 + 引擎侧运行/排队/KV/Decode tok/s（渠道地址与监控目标一致时自动联动）+ 合计行 |
+| **负载均衡** | 策略分流 | 五种策略同优先级层内分流：加权随机 / 轮询 / P2C 二选一（比在途请求数）/ 最少负载（按引擎运行请求数，监控指标感知）/ **会话亲和**（同对话粘同机保前缀缓存；新会话分给粘性会话数最少的机器防挤一台，空闲 30min 过期）；跨优先级层自动故障转移 |
+| | 主动探活 | 渠道每 10s GET /health；探活失败自动摘除（不再被路由命中），全挂不雪崩 |
+| | 负载均衡总表 | 渠道 × 引擎实时一张表：状态/探活延迟/在途/请求失败/QPS(1m)/token/均延迟 + 引擎侧运行/排队/KV/Decode tok/s（渠道地址与监控目标一致时自动联动）+ 合计行 |
 | **部署特性** | 单文件零依赖 | 纯 Python 标准库，本地/服务器一条命令起；`--demo` 内置仿真数据源可无服务预览；页面隐藏自动暂停轮询 |
 
 ## 安装（同一仓库选版本，v1/v2 并存）
 
-在目标机器（Linux，需 curl 或 wget）上选版本安装：
+仓库已发布：**https://github.com/xzwgit/vllm-dashboard**（public）。在目标机器（Linux，需 curl 或 wget）上选版本安装：
 
 ```bash
 # 一键式：装 v2（监控 + API 网关 + 负载均衡 + 主屏） / v1（纯监控大屏）
 curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v2
-curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v1
 curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v1
 # 或先落脚本再装（第二参数=安装目录）
 curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh
@@ -59,22 +58,21 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/vllm-dashboard
 ./install.sh list      # 列出仓库已发布的版本 tag
 ```
 
-- **版本来源**：`v1` / `v2` 取 git tag（历史版本固定不变）；tag 不可达时自动回退 master（v1 = 冻结副本 `vllm_dashboard_v1.py`，v2 = 主文件）；`latest` = master 开发版；也支持 `./install.sh vX.Y.Z` 直装指定 tag。
-- **raw 被墙自动兜底**：raw.githubusercontent.com 不可达的网络（国内常见）会自动改走 api.github.com 取文件（base64 解码，无需配置；需目标机有 python3）。
-- 下载后校验 `VERSION` 常量（防代理/网关返回错误页）；覆盖旧文件前自动备份 `.bak.<旧版本>.<时间戳>`；装完按版本打印下一步启动命令。
-- GitHub 直连不通的机器：`VD_PROXY=https://mirror.ghproxy.com ./install.sh v2`（raw 地址加镜像前缀）。
-- 版本 tag 随仓库发布：`v1.0.0` 指向 v1 内容的历史提交（该提交上 `vllm_dashboard.py` 即 v1），raw 地址取 tag 即固定取到该版本。
+- **版本来源**：`v1`/`v2` 优先取 git tag（历史版本固定不变）；tag 不可达时回退 master（v1=冻结副本）；`latest`=master 开发版；支持 `./install.sh vX.Y.Z` 直装指定 tag。
+- **raw 被墙自动兜底**：raw.githubusercontent.com 不可达的网络（本机即如此）自动改走 api.github.com（base64 解码，无需配置）——2026-10-27 本机实测全走兜底装成。
+- 下载后校验 `VERSION` 常量；覆盖前备份 `.bak.<旧版本>.<时间戳>`；装完按版本打印启动命令。
+- **推送通道**：本机 github.com/raw 时通时断，**推送走跳板机 14.1.99.114（tar 上去用它家 classic token 推）**，raw 验证也在跳板机上 curl。
 
 ## 快速开始
 
 ```bash
 # 监控 + API 分发网关（本地转发 → 生成 Key → 局域网分发）
-python vllm_dashboard.py --gw --target my-vllm=http://127.0.0.1:8123
+python vllm_dashboard.py --gw --target 157-1017=http://10.10.3.157:8123
 #   网关端点 http://<本机IP>:8125/gw/v1（OpenAI 兼容）；页面 ⚙ → API 分发 里生成 Key 发同事
 # 监控一个 vLLM 服务（服务地址 = OpenAI 端口，/metrics 自动拼接）
-python vllm_dashboard.py --target my-vllm=http://127.0.0.1:8123
+python vllm_dashboard.py --target 1017@154=http://10.10.3.154:8123
 # 多目标（页签切换，页面里也可随时增删，存 targets.json）
-python vllm_dashboard.py --port 8124 --target a=http://10.0.0.1:8123 --target b=http://10.0.0.2:8123 --api-key sk-xxxx
+python vllm_dashboard.py --port 8124 --target a=http://10.10.3.154:8123 --target b=http://10.10.50.180:8123 --api-key abc.12345
 # 没有服务时看界面效果（内置仿真数据源，周期负载：空闲→爬坡→c32→排空）
 python vllm_dashboard.py --demo
 ```
@@ -92,30 +90,41 @@ python vllm_dashboard.py --demo
 | 前缀缓存命中 | Δ`prefix_cache_hits_total` / Δ`prefix_cache_queries_total` |
 | 并发 / 抢占 / 完成数 | `num_requests_running` / `waiting`、`num_preemptions_total`、`request_success_total{finish_reason}` |
 
-新旧指标名都兼容（`generation_tokens_total`/`token_generation_tokens_total`、`kv_cache_usage_perc`/`gpu_cache_usage_perc`、`request_time_per_output_token_seconds`/`time_per_output_token_seconds`、`e2e_request_latency_seconds`/`request_latency_seconds`、`request_queue_time_seconds`/`time_in_queue_requests`），vLLM 0.32.0 实测对齐（含投机解码场景）。
+新旧指标名都兼容（`generation_tokens_total`/`token_generation_tokens_total`、`kv_cache_usage_perc`/`gpu_cache_usage_perc`、`request_time_per_output_token_seconds`/`time_per_output_token_seconds`、`e2e_request_latency_seconds`/`request_latency_seconds`、`request_queue_time_seconds`/`time_in_queue_requests`），vLLM 0.32.0 实测对齐（2026-10-24，.154 上 1017+DSpark k4 实测清单）。
 
 ## 文件
 
 - `vllm_dashboard.py` — 工具本体（后端抓取/聚合 + 内嵌前端，~1600 行）
 - `vllm_dashboard_v1.py` — v1.0.0 冻结副本（install.sh 的 v1 回退来源）
-- `install.sh` — 版本安装脚本（v1/v2/latest/指定 tag/list；tag 优先、回退 master 冻结副本、VD_PROXY 镜像前缀）
+- `install.sh` — 版本安装脚本（v1/v2/latest/指定 tag/list；tag 优先、回退 master 冻结副本、VD_PROXY 镜像前缀；2026-10-27 本地 mock 源全分支测试 + GitHub live list 通过）
+- `rrun.py` — paramiko 远程执行/上传小工具（154/158/162/180/55，凭据见《服务器台账.md》；`.154` 的 sftp 子系统对 paramiko 报 ENOENT，用 `--bput` base64 直写绕过；Git Bash 下带绝对路径参数须加 `MSYS_NO_PATHCONV=1`）
 - `test_mock_openai.py` — mock OpenAI 上游（非流式+流式+models+/health+/metrics），手边没有 vLLM 时联调网关用
-- `test_lb_v3.py` — 负载均衡本地测试套件（双 mock：策略分流/故障转移/探活/总表，17 项断言）
+- `test_lb_v3.py` — 负载均衡本地测试套件（双 mock：策略分流/故障转移/探活/总表，17 项断言，2026-10-27 ALL PASS）
+- `boot_lb_158.sh` / `boot_lb_162.sh` / `lb_wait_*.sh` / `lb_burst_158.py` — 2026-10-27 双机负载均衡真机测试的操作脚本存档（.158/.162 各 boot 一个 1017 副本 → 大屏+网关 → burst → 故障转移）
+- `pull_env_weights_154.sh` / `boot_1017_154.sh` / `bench_154.sh` / `wait_ready_154.sh` / `mm_*_158.*` / `agent_loop_158.sh` / `boot_157_gwtest.sh` — 2026-10-24~26 各轮实测的操作脚本存档
 
-## 实测背景
+## 2026-10-24 .154 实测记录
 
-在 8×RTX PRO 6000 96G（SM120）+ vLLM 0.32.0 + FlashInfer 0.7.2 的多卡 MoE 推理服务（TP8/EP8 + 投机解码）上完成实测：/metrics 指标口径逐项对齐、数十并发压测全程监控曲线连续无断点、网关在真实引擎上完成流式/非流式/记账对账（token 记账与引擎 usage 精确一致）。
+- 机器：10.10.3.154（server04，8×RTX PRO 6000 96G）
+- 环境：从 .158 rsync `vllm-fi02` venv（0.32.0+FI0.7.2+双补丁树，8.3G）+ FI/编译缓存；venv python 重链本机 uv cpython-3.12.13
+- 权重：.158:/data/models/DeepSeek-V4.1-Flash-1017 → .154:/data/models（476G，同网段 ~1GB/s）
+- boot：部署方案 v2.0 §4.1 形态（TP8/EP8、fp8 KV、FLASHINFER_MLA_SPARSE_DSV41、FULL 图、DSpark k4、util 0.90、capture 640、1M ctx、:8123/abc.12345）
+- 验证：探针 17*19→323 ✓、boot 日志 FULL_DECODE_ONLY ✓、/metrics 匿名可访问 ✓
+- bench：c32 1K×1K = **959 tok/s**（聚合，96G 参考带）；c32 2K×1K rate8 = 882 tok/s、TPOT 23.7ms、DSpark 接受率 23.6-27.8%（random 数据无前缀结构，偏低属预期）
+- 大屏：.154 侧 `python3 /root/dash_ops/vllm_dashboard.py --port 8124 --target '1017@154'=http://127.0.0.1:8123`（http://10.10.3.154:8124/）；本地侧同脚本指 http://10.10.3.154:8123 亦可（本地直连可达）
 
-## 状态
+## 状态（2026-10-27）
 
-- 已发布：本仓库 master = v2（监控 + 网关）；tag `v1.0.0` / `v2.0.0` 并存，`./install.sh list` 可见
-- v1（纯监控）与 v2（监控+网关）同仓按版本安装，互不覆盖
+- **已发布 GitHub**：https://github.com/xzwgit/vllm-dashboard（public；**版本重排后 tag = v1.0.0 / v2.0.0 两个**；install.sh 选版本安装，raw 被墙自动 API 兜底）
+- 公开仓只放：vllm_dashboard.py / vllm_dashboard_v1.py / install.sh / test_mock_openai.py / test_lb_v3.py / 脱敏 README——**rrun.py（含凭据）、各轮 boot/bench 脚本（含内网 IP）不上仓**，只留工作区
+- .158/.162 真机测试环境 2026-10-27 已清理（引擎/大屏全停，双机 GPU 0，dash_ops 留脚本+日志）
 
 ## 版本记录
 | 版本 | 日期 | 内容 |
 |---|---|---|
 | v1.0.0 | 2026-10-26 | 纯监控大屏：多目标抓取 / 11 张 vLLM 指标卡 / 5 图 / 服务器信息 / 模型接入卡 / CSV 导出 / 失败诊断 |
-| v2.0.0 | 2026-10-27 | **监控 + 网关 + 负载均衡 + 主屏**：API 分发网关（OpenAI 兼容反代 / Key 管理 / 记账 / 熔断）；负载均衡（四种策略 / 主动探活 / 故障转移 / 负载均衡总表）；主屏（固定第一页签：全场合计卡 ×7 + 合计曲线 + 各机对比 + 机器明细 13 列 + 右列服务器列表纯硬件简况）；选版本安装脚本（raw 被墙自动走 GitHub API 兜底） |
+| v2.1.0 | 2026-10-27 | **v2 大版打磨**（29 项合并）：负载均衡第五策略**会话亲和**（同对话粘同机保前缀缓存、最少粘性数分配防挤一台）；主屏定版（KPI 9 卡铺满含缓存命中/接受率、图表 2×2、服务器列表右列内嵌滚动、AI服务详情通栏、掉线报警横幅、服务下拉页签）；网关面板交互（右上 ✕ 关闭、渠道/Key 折叠表单）；demo 仿真引擎参数化 --demo-count；修复合计图恒空/JS 重复声明/滚动条抖动等 |
+| v2.0.0 | 2026-10-27 | **监控 + 网关 + 负载均衡 + 主屏**：API 分发网关（OpenAI 兼容反代/Key 管理/记账/熔断）；负载均衡（四种策略/主动探活/故障转移/负载均衡总表）；主屏（固定第一页签：全场合计卡×7+合计曲线+各机对比+机器明细 13 列+右列服务器列表纯硬件简况）；选版本安装脚本（raw 被墙自动 API 兜底） |
 
 
 ## 已知事项
@@ -124,3 +133,4 @@ python vllm_dashboard.py --demo
 - 计数器重启（引擎重启）自动识别，速率不回负
 - 抓取失败按原因分类报人话：连接被拒=vLLM 未启动/端口不对（Linux Errno 111 / Windows 10061 都认）；HTTP 401/403=鉴权失败提示填 Key；404=路径不对；超时/域名解析错误各自提示；均附原始错误摘要
 - 页面隐藏时暂停轮询，回来即恢复；时间范围 5m/15m/1h/全部
+- 远程机落地的脚本/日志都在 `/root/dash_ops/`（工作区规约）

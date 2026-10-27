@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""vLLM 推理监控大屏 —— Prometheus /metrics 抓取 + Web 大屏 + API 分发网关（单文件纯标准库）。
+"""AI 推理性能监控大屏 —— Prometheus /metrics 抓取 + Web 大屏 + API 分发网关（单文件纯标准库）。
 
 用法:
   # 监控一个 vLLM 服务（服务端口即 OpenAI 端口，/metrics 自动拼接）:
@@ -23,6 +23,7 @@
 """
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -41,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "2.0.0"    # v2：监控 + API 分发网关 + 负载均衡 + 主屏（全场合计/服务器列表）；v1 纯监控见 vllm_dashboard_v1.py
+VERSION = "2.1.0"    # v2.1：会话亲和策略 + 主屏大版（AI服务详情/掉线报警/下拉页签/KPI 9卡）+ 交互与布局打磨；v1 纯监控见 vllm_dashboard_v1.py
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
@@ -76,7 +77,7 @@ ALIAS_HIST = {
 SERIES_KEYS = [
     "gen_rate", "prompt_rate", "running", "waiting", "kv_perc",
     "ttft_p50", "ttft_p95", "tpot_p50", "tpot_p95", "e2e_p95", "queue_p95",
-    "spec_accept", "prefix_hit",
+    "spec_accept", "prefix_hit", "gen_tokens_total", "prompt_tokens_total",
 ]
 
 # ============================== Prometheus 文本解析 ==============================
@@ -444,6 +445,8 @@ class Target:
         qq = self._rate(t[j_pct], t[i], raw[j_pct].get("pc_queries"), cur.get("pc_queries"))
         if hq is not None and qq is not None and qq > 0:
             s["prefix_hit"] = min(1.0, hq / qq)
+        s["gen_tokens_total"] = cur.get("gen_tokens")          # 累计值序列（各机对比图用；计数器重启会归零跳变，如实记录）
+        s["prompt_tokens_total"] = cur.get("prompt_tokens")
         for k, v in s.items():
             self.series[k].append(v)
         self.last_ts = t[i]
@@ -773,8 +776,8 @@ class DemoEngine:
 
     EDGES = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60]
 
-    def __init__(self):
-        self.t0 = time.time()
+    def __init__(self, phase_shift=0.0):
+        self.t0 = time.time() - phase_shift
         self.last = self.t0
         self.reqs = []          # [ctx_in, gen, out_target, speed, done]
         self.backlog = 0
@@ -921,7 +924,9 @@ GW_BREAK_NFAIL = 3                # 连接类连续失败 N 次 → 熔断
 GW_BREAK_SECONDS = 60.0
 GW_PROBE_INTERVAL = 10.0          # 渠道主动探活间隔（GET /health）
 GW_PROBE_TIMEOUT = 3.0
-GW_LB_POLICIES = ("weight", "round_robin", "p2c", "least_requests")
+GW_LB_POLICIES = ("weight", "round_robin", "p2c", "least_requests", "session")
+GW_AFF_TTL = 1800.0      # 会话亲和记录空闲过期（秒）
+GW_AFF_MAX = 20000       # 会话表上限（超过先清过期）
 
 
 class Gateway:
@@ -935,6 +940,7 @@ class Gateway:
         self.rpm_win = {}
         self.chan = {}
         self.reqwin = {}               # 渠道 → 请求时间窗（QPS 统计）
+        self.aff = {}                  # 会话亲和表：md5(对话前缀) → {"ch": 渠道名, "ts": 最近使用}
         self.metrics_fn = None         # base_url → 引擎指标简表（main 注入；指标感知路由/总表用）
         self._rr = 0                   # round_robin 轮询计数
         self.totals = {"requests": 0, "ok": 0, "fail": 0, "tokens": 0}
@@ -1088,10 +1094,11 @@ class Gateway:
             if st:
                 st["inflight"] = max(0, st.get("inflight", 0) - 1)
 
-    def pick_channel(self, exclude=()):
+    def pick_channel(self, exclude=(), hint=None):
         """按负载均衡策略选渠道：同优先级层内分流，跨层按优先级（低者优先，留给故障转移）。
         策略：weight=加权随机（默认） / round_robin=轮询 / p2c=随机抽二选在途少 /
-        least_requests=选引擎运行请求最少（监控指标感知，取不到用在途数）。"""
+        least_requests=选引擎运行请求最少（监控指标感知，取不到用在途数） /
+        session=会话亲和（同对话粘同机保前缀缓存；新会话分给粘性会话数最少的机器，防挤一台）。"""
         now = time.time()
         with self.lock:
             cands = [c for c in self.data["channels"]
@@ -1112,6 +1119,38 @@ class Gateway:
         def inflight(c):
             return self.chan.get(c["name"], {}).get("inflight", 0)
 
+        if pol == "session":
+            if hint:
+                h = hashlib.md5(hint.encode("utf-8", "replace")).hexdigest()
+                with self.lock:
+                    rec = self.aff.get(h)
+                    if rec and rec["ch"] in {c["name"] for c in same}:
+                        rec["ts"] = now
+                        for c in same:
+                            if c["name"] == rec["ch"]:
+                                return c
+                    # 新会话（或原机已不可用）→ 分给粘性会话数最少的机器，并列加权随机
+                    if len(self.aff) > GW_AFF_MAX:
+                        for k in [k for k, v in self.aff.items() if now - v["ts"] > GW_AFF_TTL]:
+                            del self.aff[k]
+                    cnt = {c["name"]: 0 for c in same}
+                    for v in self.aff.values():
+                        if now - v["ts"] <= GW_AFF_TTL and v["ch"] in cnt:
+                            cnt[v["ch"]] += 1
+                    m0 = min(cnt.values())
+                    pool = [c for c in same if cnt[c["name"]] == m0]
+                    tw = sum(c.get("weight", 10) for c in pool)
+                    r = random.uniform(0, tw)
+                    acc = 0
+                    pick = pool[-1]
+                    for c in pool:
+                        acc += c.get("weight", 10)
+                        if r <= acc:
+                            pick = c
+                            break
+                    self.aff[h] = {"ch": pick["name"], "ts": now}
+                    return pick
+            # 无请求体（GET 等）→ 按加权随机
         if pol == "round_robin":
             with self.lock:
                 self._rr = (self._rr + 1) % len(same)
@@ -1323,10 +1362,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n) if n else b""
         is_stream = False
+        aff_key = None
         if method == "POST" and body[:1] == b"{":
             try:
                 j = json.loads(body.decode("utf-8", "replace"))
                 is_stream = bool(j.get("stream"))
+                # 会话亲和键：对话首条消息（system/首条 user）前 1000 字——同会话各轮此键不变
+                msgs = j.get("messages")
+                if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict):
+                    c0 = msgs[0].get("content")
+                    if c0:
+                        aff_key = str(c0)[:1000]
+                if not aff_key and j.get("prompt"):
+                    aff_key = str(j["prompt"])[:1000]
                 if is_stream:
                     so = j.setdefault("stream_options", {})
                     if not isinstance(so, dict):
@@ -1343,7 +1391,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         last_err = "无可用渠道"
         while tried < nch:
             tried += 1
-            ch = gw.pick_channel(exclude=tried_names)
+            ch = gw.pick_channel(exclude=tried_names, hint=aff_key)
             if ch is None:
                 break
             tried_names.append(ch["name"])
@@ -1440,7 +1488,7 @@ HTML = None  # 见文件底部 _build_html()
 
 class Handler(BaseHTTPRequestHandler):
     reg = None       # type: Registry
-    demo = None      # type: DemoEngine
+    demos = []       # type: list  仿真引擎列表（demo 模式）
     node = None      # type: NodeCollector
     gw = None        # type: Gateway
     gw_port = 0
@@ -1482,6 +1530,8 @@ class Handler(BaseHTTPRequestHandler):
             kv_max = None
             kv_name = ""
             tpots = []
+            pcs = []
+            specs = []
             for t in Handler.reg.targets:
                 n_tot += 1
                 nb = t.now_brief() or {}
@@ -1512,6 +1562,10 @@ class Handler(BaseHTTPRequestHandler):
                         kv_name = t.name
                     if nb.get("tpot_p95") is not None:
                         tpots.append(nb["tpot_p95"])
+                    if nb.get("prefix_hit") is not None:
+                        pcs.append(nb["prefix_hit"])
+                    if nb.get("spec_accept") is not None:
+                        specs.append(nb["spec_accept"])
                 for k in ("running", "waiting", "kv_perc", "gen_rate", "prompt_rate",
                           "tpot_p95", "ttft_p95", "gen_tokens_total",
                           "prompt_tokens_total", "preemptions", "finished",
@@ -1523,6 +1577,8 @@ class Handler(BaseHTTPRequestHandler):
                 row["context_len"] = getattr(t, "context_len", "")
                 rows.append(row)
             tot["tpot_p95"] = (sum(tpots) / len(tpots)) if tpots else None
+            tot["prefix_hit"] = (sum(pcs) / len(pcs)) if pcs else None
+            tot["spec_accept"] = (sum(specs) / len(specs)) if specs else None
             gw = None
             if Handler.gw:
                 gw = {"enabled": Handler.gw.enabled, "port": Handler.gw_port,
@@ -1549,9 +1605,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "no such target"}, 404)
                 return
             self._json(t.snapshot(maxpoints=maxp))
-        elif path == "/api/demo-metrics":
-            if Handler.demo:
-                body = Handler.demo.render().encode("utf-8")
+        elif path.startswith("/api/demo-metrics"):
+            tail = path[len("/api/demo-metrics"):]
+            idx = int(tail) if tail.isdigit() else 0   # 只认纯数字后缀（防 /v1/models 之类拼接路径炸解析）
+            if idx < len(Handler.demos) and Handler.demos[idx]:
+                body = Handler.demos[idx].render().encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -1619,7 +1677,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global HTML
-    ap = argparse.ArgumentParser(description="vLLM 推理监控大屏（单文件，标准库）")
+    ap = argparse.ArgumentParser(description="AI 推理性能监控大屏（单文件，标准库）")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8124)
     ap.add_argument("--target", action="append", default=[],
@@ -1629,6 +1687,7 @@ def main():
     ap.add_argument("--history", type=int, default=DEFAULT_HISTORY)
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets.json"))
     ap.add_argument("--demo", action="store_true", help="内置仿真数据源（无真实服务时演示界面）")
+    ap.add_argument("--demo-count", type=int, default=10, help="仿真源数量（默认 10，上限 26）")
     ap.add_argument("--gw", action="store_true", help="启用 API 分发网关（/gw/v1/* OpenAI 兼容端点）")
     ap.add_argument("--gw-port", type=int, default=8125, help="网关监听端口（默认 8125）")
     ap.add_argument("--gw-config", default=os.path.join(
@@ -1640,7 +1699,7 @@ def main():
     except Exception:
         pass
 
-    HTML = _build_html()
+    HTML = _build_html().replace("__APPVER__", VERSION)
     reg = Registry(args.config)
     Handler.reg = reg
     Handler.node = NodeCollector(interval=max(3.0, args.interval + 1.0))
@@ -1649,15 +1708,13 @@ def main():
 
     demo_url = None
     if args.demo:
-        Handler.demo = DemoEngine()
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        demo_port = s.getsockname()[1]
-        s.close()
-        # demo 指标挂在主服务的 /api/demo-metrics 上，直接注册为本地回环目标
-        demo_url = "http://127.0.0.1:%d/api/demo-metrics" % args.port
-        reg.add("demo 仿真", demo_url, transient=True)
-        print("[demo] 仿真数据源已启用（周期负载：空闲-爬坡-c32-排空）")
+        # demo 指标挂在主服务 /api/demo-metrics[N] 上，直接注册为本地回环目标
+        for i in range(max(1, min(args.demo_count, 26))):
+            Handler.demos.append(DemoEngine(phase_shift=(i * 37) % 190.0))
+            suf = "" if i == 0 else str(i)   # 后缀=索引：/api/demo-metricsN → demos[N]
+            reg.add("demo 仿真 %s" % "ABCDEFGHIJKLMNOP"[i],
+                    "http://127.0.0.1:%d/api/demo-metrics%s" % (args.port, suf), transient=True)
+        print("[demo] 仿真数据源 ×%d 已启用（周期负载：空闲-爬坡-c32-排空）" % len(Handler.demos))
 
     for spec in args.target:
         if "=" in spec:
@@ -1694,7 +1751,7 @@ def main():
               len(gw.data["keys"]), args.gw_config))
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print("=" * 62)
-    print("  vLLM 推理监控大屏已启动  (v%s)" % VERSION)
+    print("  AI 推理性能监控大屏已启动  (v%s)" % VERSION)
     print("  界面:   http://%s:%d/" % ("127.0.0.1" if args.host == "0.0.0.0" else args.host, args.port))
     print("  目标数: %d | 抓取间隔 %.0fs | 历史 %d 点/目标" % (len(reg.targets), args.interval, args.history))
     print("  目标配置持久化: %s" % args.config)
@@ -1719,8 +1776,9 @@ def _build_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vLLM 推理监控大屏</title>
+<title>AI 推理性能监控大屏</title>
 <style>
+html{scrollbar-gutter:stable}
 :root{
   --bg:#070b16; --panel:rgba(20,28,48,.55); --panel-border:rgba(120,160,255,.14);
   --txt:#dbe6ff; --dim:#7f8db0; --accent:#22d3ee; --blue:#60a5fa; --violet:#a78bfa;
@@ -1741,7 +1799,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
   background-image:linear-gradient(rgba(130,160,255,.05) 1px,transparent 1px),
     linear-gradient(90deg,rgba(130,160,255,.05) 1px,transparent 1px);
   background-size:44px 44px;}
-.wrap{max-width:1780px;margin:0;padding:12px 14px 26px;position:relative}
+.wrap{max-width:none;margin:0;padding:12px 14px 26px;position:relative}
 
 /* ---- header（标题独占居中行，其余下移工具栏） ---- */
 .brand{display:flex;justify-content:center;padding:2px 0 10px}
@@ -1759,17 +1817,29 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
   box-shadow:0 10px 30px rgba(0,0,0,.5)}
 .menu .mi{padding:9px 12px;border-radius:8px;font-size:13px;color:var(--txt);cursor:pointer;white-space:nowrap}
 .menu .mi:hover{background:rgba(34,211,238,.10);color:#aef3ff}
+.menu .mver{padding:7px 12px 3px;font-size:11px;color:var(--dim);border-top:1px solid rgba(130,160,255,.18);
+  margin-top:5px;cursor:default;user-select:text}
 .tabs{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .tab{padding:7px 14px;border-radius:9px;cursor:pointer;border:1px solid var(--panel-border);
   background:var(--panel);font-size:13px;display:flex;gap:8px;align-items:center;user-select:none}
 .tab.active{border-color:rgba(34,211,238,.55);background:rgba(34,211,238,.10);color:#aef3ff}
 .tab .x{color:var(--dim);font-size:11px;padding:0 2px;border-radius:4px}
+.tsel{background:var(--panel);color:var(--txt);border:1px solid var(--panel-border);border-radius:9px;
+  padding:6px 10px;font-size:13px;cursor:pointer;max-width:220px}
+.tbtn{padding:6px 10px;border-radius:9px;border:1px solid var(--panel-border);background:var(--panel);
+  color:var(--dim);font-size:12.5px;cursor:pointer;user-select:none}
+.tbtn:hover{color:#aef3ff;border-color:rgba(34,211,238,.45)}
+.tbtn.danger:hover{color:#fda4af;border-color:rgba(251,113,133,.5)}
 .tab .x:hover{color:var(--rose)}
 .tab .led{width:8px;height:8px;border-radius:50%;background:#555}
 .tab .led.up{background:var(--green);box-shadow:0 0 8px var(--green)}
 .tab .led.down{background:var(--rose);box-shadow:0 0 8px var(--rose)}
+#ovAlarm{background:rgba(251,113,133,.10);border:1px solid rgba(251,113,133,.45);color:#fda4af;
+  padding:9px 14px;border-radius:10px;margin-bottom:10px;font-size:13.5px}
 .ovtbl{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px}
-.ovtbl th:nth-child(2){width:92px}
+.ovtbl th:nth-child(1){width:34px}
+.ovtbl th:nth-child(2){width:96px}
+.ovtbl th:nth-child(2),.ovtbl td:nth-child(2){text-align:center}
 .ovtbl th:nth-child(11){width:205px}
 .ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 5px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px;overflow:hidden;text-overflow:ellipsis}
 .ovtbl td{padding:2px 5px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35;overflow:hidden;text-overflow:ellipsis}
@@ -1800,13 +1870,15 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
   gap:10px;align-content:start;justify-content:start}
 .nodes{display:grid;grid-template-columns:minmax(240px,1fr);gap:12px;
   flex:1 1 340px;min-width:300px;align-content:start}
-.ovlay{display:flex;gap:12px;align-items:stretch}
-#ovKpis{grid-template-columns:repeat(7,minmax(118px,150px))}
-.ovL{flex:1;min-width:0}
-.ovR{width:335px;flex:none;display:flex}
-.ovR .card{flex:1;display:flex;flex-direction:column;min-height:0}
+.ovlay{position:relative;display:flex;align-items:flex-start}
+#lg-ovcum{display:none}   # 机器多时图例占空间，隐藏（悬停仍显示每线名称）
+#mainOv .charts{grid-template-columns:repeat(2,minmax(0,1fr))}
+#ovKpis{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));justify-content:stretch}
+.ovL{flex:1;min-width:0;margin-right:350px}
+.ovR{position:absolute;top:0;right:0;bottom:0;width:338px;display:flex}
+.ovR .card{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .ovR .card h4{flex:none}
-#ovNodes{flex:1;overflow-y:auto;min-height:0;padding-right:2px}
+#ovNodes{flex:1;overflow-y:auto;min-height:0;padding-right:4px}
 .ovnode{padding:8px 10px;border:1px solid var(--panel-border);border-radius:10px;margin-bottom:8px;
   background:rgba(15,23,42,.35);cursor:pointer}
 .ovnode:hover{border-color:rgba(34,211,238,.4)}
@@ -1864,7 +1936,9 @@ canvas.chart{width:100%;height:100%;display:block}
 /* ---- modal ---- */
 .modal-bg{position:fixed;inset:0;background:rgba(4,7,15,.7);display:none;z-index:100;
   align-items:center;justify-content:center;backdrop-filter:blur(3px)}
-.modal{width:420px;background:#0d1428;border:1px solid rgba(130,160,255,.25);border-radius:16px;padding:22px}
+.modal{position:relative;width:420px;background:#0d1428;border:1px solid rgba(130,160,255,.25);border-radius:16px;padding:22px}
+.mclose{position:absolute;right:12px;top:10px;cursor:pointer;color:var(--dim);font-size:17px;line-height:1;padding:4px 7px;border-radius:8px;user-select:none}
+.mclose:hover{color:#fda4af;background:rgba(251,113,133,.12)}
 .modal h3{font-size:16px;margin-bottom:14px;color:#cfe0ff}
 .modal label{display:block;font-size:12px;color:var(--dim);margin:12px 0 5px}
 .modal input{width:100%;padding:9px 12px;border-radius:9px;border:1px solid rgba(130,160,255,.25);
@@ -1890,6 +1964,10 @@ canvas.chart{width:100%;height:100%;display:block}
 .gwtable .op{color:#67e8f9;cursor:pointer;margin-right:2px}
 .gwtable .op:hover{text-decoration:underline}
 .gwform{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}
+.gwadd{margin-top:8px;color:#67e8f9;font-size:12.5px;cursor:pointer;user-select:none;display:inline-block;padding:3px 8px;border-radius:7px}
+.gwadd:hover{background:rgba(34,211,238,.10)}
+.slide{overflow:hidden;max-height:0;transition:max-height .22s ease}
+.slide.open{max-height:200px}
 .gwform input{padding:7px 10px;border-radius:8px;border:1px solid rgba(130,160,255,.25);
   background:rgba(20,28,48,.8);color:var(--txt);font-size:12.5px;outline:none}
 .gwform button{padding:8px 16px;border-radius:8px;border:none;cursor:pointer;font-size:12.5px;
@@ -1904,7 +1982,7 @@ canvas.chart{width:100%;height:100%;display:block}
 <body>
 <div class="wrap">
   <header>
-  <div class="brand"><h1>vLLM 推理监控大屏</h1></div>
+  <div class="brand"><h1>AI 推理性能监控大屏</h1></div>
   <div class="toolbar">
     <div class="tabs" id="tabs"></div>
     <div class="spacer"></div>
@@ -1918,6 +1996,7 @@ canvas.chart{width:100%;height:100%;display:block}
         <div class="mi" id="miAdd">＋ 添加监控目标</div>
         <div class="mi" id="miExport">⬇ 导出日志（CSV）</div>
         <div class="mi" id="miGw">🔌 API 分发（网关）</div>
+        <div class="mver" title="当前运行的版本">v__APPVER__</div>
       </div>
     </div>
   </div>
@@ -1925,6 +2004,7 @@ canvas.chart{width:100%;height:100%;display:block}
   <div id="banner"></div>
 
   <div id="mainOv" style="display:none">
+    <div id="ovAlarm" style="display:none"></div>
     <div class="ovlay">
     <div class="ovL">
     <div class="zone">
@@ -1933,7 +2013,7 @@ canvas.chart{width:100%;height:100%;display:block}
         <div class="kpis" id="ovKpis"></div>
       </div>
     </div>
-    <div class="charts">
+    <div class="charts" style="grid-template-columns:repeat(2,minmax(0,1fr))">
       <div class="panel"><h3>Decode 吞吐（合计）<span class="legend" id="lg-ovdec"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovdec"></canvas></div></div>
       <div class="panel"><h3>Prefill 吞吐（合计）<span class="legend" id="lg-ovpre"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovpre"></canvas></div></div>
       <div class="panel"><h3>并发请求（合计）<span class="legend" id="lg-ovcc"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovcc"></canvas></div></div>
@@ -1945,7 +2025,7 @@ canvas.chart{width:100%;height:100%;display:block}
     </div>
     </div>
     <div class="info">
-      <div class="card" id="ovmachCard"><h4>机器明细（点击名称切换到该机大屏）</h4>
+      <div class="card" id="ovmachCard"><h4>AI服务详情（点击名称切换到该服务大屏）</h4>
         <table class="ovtbl" id="tb-ovmach"><thead><tr>
           <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>缓存命中</th><th>接受率</th><th>累计生成</th><th>模型</th><th>上下文</th><th>版本</th>
         </tr></thead><tbody></tbody></table>
@@ -1995,6 +2075,7 @@ canvas.chart{width:100%;height:100%;display:block}
 </div>
 <div class="modal-bg" id="gwModalBg">
   <div class="modal wide">
+    <div class="mclose" id="gwCloseX" title="关闭">✕</div>
     <h3>API 分发（网关）</h3>
     <div id="gwOff" style="display:none;color:#fda4af;font-size:13px;margin-bottom:10px">
       网关未启动：用 <span class="mono">--gw</span> 参数启动大屏后可用（如 <span class="mono">python vllm_dashboard.py --gw</span>）
@@ -2008,12 +2089,12 @@ canvas.chart{width:100%;height:100%;display:block}
               <option value="round_robin">轮询</option>
               <option value="p2c">P2C 二选一</option>
               <option value="least_requests">最少负载</option>
+              <option value="session">会话亲和（前缀缓存）</option>
             </select>
           </span>
         </div>
         <div class="gwbtns">
           <button id="gwToggleBtn">暂停转发</button>
-          <button id="gwCloseBtn" style="margin-left:8px">关闭</button>
         </div>
       </div>
       <div class="gwstats" id="gwStats"></div>
@@ -2024,25 +2105,27 @@ canvas.chart{width:100%;height:100%;display:block}
         <th>请求/失败</th><th>QPS(1m)</th><th>token</th><th>均延迟</th>
         <th>引擎: 运行/排队 · KV · Decode</th><th>操作</th>
       </tr></thead><tbody></tbody><tfoot></tfoot></table>
-      <div class="gwform" id="gwChanForm">
+      <div class="gwadd" id="gcToggle">＋ 添加渠道</div>
+      <div class="slide" id="gcSlide"><div class="gwform" id="gwChanForm">
         <input id="gcName" placeholder="名称（如 prod-1）" style="width:120px">
         <input id="gcUrl" placeholder="http://127.0.0.1:8123" style="width:200px">
         <input id="gcKey" placeholder="上游Key(可空)" style="width:110px">
         <input id="gcPri" placeholder="优先级1" style="width:80px" value="1">
         <input id="gcWt" placeholder="权重10" style="width:80px" value="10">
-        <button id="gcAdd">＋ 添加渠道</button>
-      </div>
+        <button id="gcAdd">确 定</button>
+      </div></div>
 
       <h4 class="gwh">接入 Key <span class="dim">（生成后发给同事：接入地址 + Key + 模型名）</span></h4>
       <table class="gwtable" id="gwKeyT"><thead><tr>
         <th>名称</th><th>Key（点击复制）</th><th>RPM 限</th><th>配额/已用 token</th><th>请求</th><th>状态</th><th>操作</th>
       </tr></thead><tbody></tbody></table>
-      <div class="gwform" id="gwKeyForm">
+      <div class="gwadd" id="gkToggle">＋ 生成 Key</div>
+      <div class="slide" id="gkSlide"><div class="gwform" id="gwKeyForm">
         <input id="gkName" placeholder="Key 名称（如 张三）" style="width:150px">
         <input id="gkRpm" placeholder="RPM 限额（0=不限）" style="width:150px">
         <input id="gkQuota" placeholder="token 配额（0=不限）" style="width:160px">
-        <button id="gkGen">＋ 生成 Key</button>
-      </div>
+        <button id="gkGen">确 定</button>
+      </div></div>
     </div>
   </div>
 </div>
@@ -2286,16 +2369,22 @@ function renderTabs(){
   ov.title="主屏（全场合计，固定）";
   ov.onclick=()=>{activeId=OV;renderTabs();pollData();};
   box.appendChild(ov);
-  for(const t of targets){
-    const el=document.createElement("div");
-    el.className="tab"+(t.id===activeId?" active":"");
-    el.innerHTML=`<span class="led ${t.status}"></span><span class="nm">${t.name}</span><span class="x" title="移除">✕</span>`;
-    el.onclick=e=>{
-      if(e.target.classList.contains("x")){
-        if(confirm("移除目标 "+t.name+"？")){fetch("/api/targets/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:t.id})}).then(()=>{if(activeId===t.id)activeId=OV;pollTargets();});}
-        return;}
-      activeId=t.id;renderTabs();pollData();};
-    box.appendChild(el);
+  // 机器多了改下拉选择（主屏固定不动）
+  if(targets.length){
+    const sel=document.createElement("select");
+    sel.className="tsel";
+    sel.innerHTML=targets.map(t=>
+      `<option value="${t.id}" ${t.id===activeId?"selected":""}>${t.status==="up"?"●":"○"} ${esc(t.name)}</option>`).join("");
+    sel.onchange=()=>{activeId=sel.value;renderTabs();pollData();};
+    box.appendChild(sel);
+    const del=document.createElement("span");
+    del.className="tbtn danger";del.textContent="✕ 移除";del.title="移除当前选中的服务";
+    del.style.display=activeId===OV?"none":"inline-block";
+    del.onclick=()=>{
+      const t=targets.find(x=>x.id===activeId);if(!t)return;
+      if(confirm("移除目标 "+t.name+"？")){fetch("/api/targets/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:t.id})}).then(()=>{activeId=OV;pollTargets();});}
+    };
+    box.appendChild(del);
   }
   switchView();
 }
@@ -2327,8 +2416,9 @@ async function pollOverview(){
   const sers=res.filter(d=>d&&d.series&&d.series.t);
   ovSeries=sers;
   if(activeId===OV){
-    const dec=sumSeries(sers,"gen_rate"),pre=sumSeries(sers,"prompt_rate"),
-          run=sumSeries(sers,"running"),wait=sumSeries(sers,"waiting");
+    const ser=sers.map(d=>d.series);   // 合计求和在 series 层做（fix：此前误传整个 data 载荷导致合计图恒空）
+    const dec=sumSeries(ser,"gen_rate"),pre=sumSeries(ser,"prompt_rate"),
+          run=sumSeries(ser,"running"),wait=sumSeries(ser,"waiting");
     CH["ch-ovdec"].setData(dec.t,{gen_rate:dec.v});
     CH["ch-ovpre"].setData(pre.t,{prompt_rate:pre.v});
     CH["ch-ovcc"].setData(run.t,{running:run.v,waiting:wait.v});
@@ -2364,16 +2454,22 @@ function renderOverview(ov){
     {lbl:"KV Cache 最高",val:ov.kv_max==null?"—":fmtPct(ov.kv_max),unit:"",
      sub:ov.kv_max_name?("最高: "+ov.kv_max_name):"",cls:(ov.kv_max!=null&&ov.kv_max>=0.9)?"c-rose":"c-green"},
     {lbl:"TPOT p95 均值",val:t.tpot_p95==null?"—":fmtMs(t.tpot_p95),unit:"",sub:"各机 p95 平均",cls:"c-amber"},
+    {lbl:"前缀缓存命中",val:t.prefix_hit==null?"—":fmtPct(t.prefix_hit),unit:"",sub:"各机平均",cls:"c-green"},
+    {lbl:"投机接受率",val:t.spec_accept==null?"—":fmtPct(t.spec_accept),unit:"",sub:"各机平均",cls:"c-violet"},
     {lbl:"全场累计生成",val:fmtTok(t.gen_tokens_total),unit:"tok",
      sub:"完成 "+fmtInt(t.finished)+" · 预填 "+fmtTok(t.prompt_tokens_total)+" · 抢占 "+fmtInt(t.preemptions),cls:"c-cyan"}];
   $("ovKpis").innerHTML=kpis.map(k=>`
     <div class="kpi ${k.cls||""}"><div class="lbl"><span>${k.lbl}</span></div>
     <div class="val">${k.val}${k.unit?`<span class="unit">${k.unit}</span>`:""}</div>
     <div class="sub">${esc(k.sub||"")}</div></div>`).join("");
+  const al=$("ovAlarm");
+  if(downs.length){al.style.display="block";
+    al.innerHTML=`⚠ <b>掉线报警：${downs.length} 台离线</b> —— ${esc(downs.join("、"))}（其余 ${ov.n_up} 台正常）`;
+  }else al.style.display="none";
   $("tb-ovsum").innerHTML=`
    <tr><td>监控目标</td><td>${ov.n_total} 个（${ov.n_up} 在线）</td></tr>
-   <tr><td>在线机器</td><td>${esc(ov.targets.filter(x=>x.status==="up").map(x=>x.name).join("、")||"—")}</td></tr>
-   ${ov.gw?`<tr><td>API 网关</td><td>${ov.gw.enabled?"<span style='color:#6ee7b7'>运行中 ✓</span>":"已暂停"} · 端口 ${ov.gw.port} · 策略 ${{weight:"加权随机",round_robin:"轮询",p2c:"P2C",least_requests:"最少负载"}[ov.gw.policy]||ov.gw.policy}</td></tr>`
+   <tr><td>在线机器</td><td>${ov.n_up} 台在线</td></tr>
+   ${ov.gw?`<tr><td>API 网关</td><td>${ov.gw.enabled?"<span style='color:#6ee7b7'>运行中 ✓</span>":"已暂停"} · 端口 ${ov.gw.port} · 策略 ${{weight:"加权随机",round_robin:"轮询",p2c:"P2C",least_requests:"最少负载",session:"会话亲和"}[ov.gw.policy]||ov.gw.policy}</td></tr>`
           :`<tr><td>API 网关</td><td>未启用（--gw）</td></tr>`}
    <tr><td>汇总口径</td><td>吞吐/并发为各机求和；TPOT 为各机 p95 平均；KV 取最高</td></tr>`;
   $("ovNodes").innerHTML=ov.targets.map(r=>{
@@ -2493,23 +2589,25 @@ $("miAdd").onclick=()=>{gearMenu.style.display="none";$("mErr").textContent="";
   $("modalBg").style.display="flex";$("mName").focus();};
 $("miExport").onclick=()=>{gearMenu.style.display="none";doExport();};
 $("miGw").onclick=()=>{gearMenu.style.display="none";gwOpen();};
-$("gwCloseBtn").onclick=gwClose;
+$("gwCloseX").onclick=gwClose;
 $("gwModalBg").onclick=e=>{if(e.target===$("gwModalBg"))gwClose();};
 $("gwToggleBtn").onclick=async()=>{const j=await gwPost("/api/gateway/toggle");if(j.ok)gwPoll();};
 $("gwPolicy").onchange=async()=>{
   const j=await gwPost("/api/gateway/policy",{policy:$("gwPolicy").value});
   if(j.ok){toast("负载均衡策略已切换");}else{toast("策略设置失败");$("gwPolicy").value=gwData?gwData.policy:"weight";}
 };
+$("gcToggle").onclick=()=>{const el=$("gcSlide");el.classList.toggle("open");$("gcToggle").textContent=el.classList.contains("open")?"－ 收起":"＋ 添加渠道";};
+$("gkToggle").onclick=()=>{const el=$("gkSlide");el.classList.toggle("open");$("gkToggle").textContent=el.classList.contains("open")?"－ 收起":"＋ 生成 Key";};
 $("gcAdd").onclick=async()=>{
   const j=await gwPost("/api/gateway/channel",{name:$("gcName").value.trim(),
     url:$("gcUrl").value.trim(),api_key:$("gcKey").value.trim(),
     priority:parseInt($("gcPri").value||"1"),weight:parseInt($("gcWt").value||"10")});
-  if(j.ok){$("gcName").value=$("gcUrl").value=$("gcKey").value="";toast("渠道已添加");gwPoll();}
+  if(j.ok){$("gcName").value=$("gcUrl").value=$("gcKey").value="";toast("渠道已添加");$("gcSlide").classList.remove("open");$("gcToggle").textContent="＋ 添加渠道";gwPoll();}
   else toast(j.error||"添加失败");};
 $("gkGen").onclick=async()=>{
   const j=await gwPost("/api/gateway/key",{name:$("gkName").value.trim(),
     rpm:parseInt($("gkRpm").value||"0")||0,quota_tokens:parseInt($("gkQuota").value||"0")||0});
-  if(j.ok){$("gkName").value=$("gkRpm").value=$("gkQuota").value="";
+  if(j.ok){$("gkName").value=$("gkRpm").value=$("gkQuota").value="";$("gkSlide").classList.remove("open");$("gkToggle").textContent="＋ 生成 Key";
     gwPoll();setTimeout(()=>{
       copyText(gwAccessSnippet(j.key),"Key 已生成，接入信息已复制，直接发给同事即可");
     },400);}
@@ -2673,7 +2771,7 @@ function doExport(){
     e2e_p95:"e2e_p95_s",queue_p95:"queue_p95_s",spec_accept:"spec_accept",prefix_hit:"prefix_hit"};
   const t=data.series.t;
   const L=[];
-  L.push("# vLLM 推理监控大屏 - 监控日志导出");
+  L.push("# AI 推理性能监控大屏 - 监控日志导出");
   L.push("# target: "+data.name+"    metrics: "+data.url+"/metrics");
   L.push("# exported_at: "+new Date().toLocaleString("zh-CN"));
   L.push("# points: "+t.length+"    interval_s: "+data.interval);

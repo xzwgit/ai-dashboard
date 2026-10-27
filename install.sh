@@ -75,7 +75,7 @@ resolve() {
       DESC="v1（纯监控大屏）"
       ;;
     v2)
-      REF="v2.0.0"; FB_REF="master"; FB_FILE="vllm_dashboard.py"
+      REF="v2.1.0"; FB_REF="master"; FB_FILE="vllm_dashboard.py"
       DESC="v2（监控 + API 网关 + 负载均衡 + 主屏）"
       ;;
     latest)

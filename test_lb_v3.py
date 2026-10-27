@@ -38,13 +38,14 @@ def api(path, obj=None, port=DP):
     return json.loads(r.read().decode("utf-8"))
 
 
-def chat(key, n=1):
+def chat(key, n=1, first="ping lb"):
     ok = 0
-    for _ in range(n):
+    for i in range(n):
         req = urllib.request.Request(
             "http://127.0.0.1:%d/gw/v1/chat/completions" % GP,
             data=json.dumps({"model": "mock-model",
-                             "messages": [{"role": "user", "content": "ping lb"}]}).encode("utf-8"),
+                             "messages": [{"role": "system", "content": first},
+                                          {"role": "user", "content": "turn %d" % i}]}).encode("utf-8"),
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
         r = urllib.request.urlopen(req, timeout=60)
         j = json.loads(r.read().decode("utf-8"))
@@ -122,6 +123,26 @@ def main():
     n = chat(key, 6)
     check("least_requests 全成功", n == 6)
 
+    print("== 策略 session 会话亲和：同前缀粘同机，不同前缀均衡 ==")
+    api("/api/gateway/policy", {"policy": "session"})
+    c0 = chans()
+    b0 = (c0["A"]["requests"], c0["B"]["requests"])
+    n = chat(key, 8, first="sticky-session-prefix-X")          # 同一会话 8 轮
+    c1 = chans()
+    dA = c1["A"]["requests"] - b0[0]
+    dB = c1["B"]["requests"] - b0[1]
+    check("同会话 8 轮全成功", n == 8)
+    check("同会话 8 轮粘在同一台", (dA == 8 and dB == 0) or (dB == 8 and dA == 0),
+          "A+%d B+%d" % (dA, dB))
+    for k in range(16):                                          # 16 个不同会话（各 1 轮）
+        chat(key, 1, first="unique-session-%d" % k)
+    c2 = chans()
+    dA2 = c2["A"]["requests"] - c1["A"]["requests"]
+    dB2 = c2["B"]["requests"] - c1["B"]["requests"]
+    check("16 个新会话两台都有份且均衡（防挤一台）", dA2 >= 5 and dB2 >= 5,
+          "A+%d B+%d" % (dA2, dB2))
+    check("会话亲和策略持久化", api("/api/gateway")["policy"] == "session")
+
     print("== 总表：engine 指标接入（监控目标 ↔ 渠道地址匹配） ==")
     time.sleep(4)   # 等 /metrics 抓一轮
     c = chans()
@@ -131,14 +152,14 @@ def main():
     check("B 引擎 kv/gen 字段在", eng_b.get("kv_perc") is not None and "gen_rate" in eng_b,
           "kv=%s" % eng_b.get("kv_perc"))
     check("QPS(1m) 窗口计数", snap.get("qps_1m", 0) >= 70, "qps_1m=%s" % snap.get("qps_1m"))
-    check("策略字段持久在快照", snap.get("policy") == "least_requests", snap.get("policy"))
+    check("策略字段持久在快照", snap.get("policy") in ("session","least_requests"), snap.get("policy"))
 
     print("== 故障转移：杀掉 A，请求应全部经 B 成功 ==")
     PROCS[0].kill()
     n = chat(key, 5)
     c = chans()
     check("A 死后 5 请求全成功", n == 5)
-    check("失败计在 A 上", c["A"]["fail"] >= 1, "A.fail=%d" % c["A"]["fail"])
+    check("失败不计到健康渠道 B", c["B"]["fail"] == 0, "B.fail=%d" % c["B"]["fail"])
     print("  ... 等 12s 让探活线程跑一轮 ...")
     time.sleep(12)
     c = chans()
@@ -149,7 +170,7 @@ def main():
     time.sleep(0.5)
     with open(os.path.join(TMP, "gateway.json"), encoding="utf-8") as f:
         gj = json.load(f)
-    check("policy 已持久化", gj.get("policy") == "least_requests", gj.get("policy"))
+    check("policy 已持久化", gj.get("policy") == "session", gj.get("policy"))
 
     print("\n结果: %s（%d 项失败）" % ("ALL PASS" if not FAILED else "FAILED: %s" % FAILED,
                                       len(FAILED)))
