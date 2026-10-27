@@ -466,8 +466,8 @@ class Target:
             return {"status": self.status, "running": cur.get("running"),
                     "waiting": cur.get("waiting"), "kv_perc": cur.get("kv_perc"),
                     "gen_rate": last("gen_rate"), "prompt_rate": last("prompt_rate"),
-                    "prefix_hit": last("prefix_hit"), "ttft_p95": last("ttft_p95"),
-                    "tpot_p95": last("tpot_p95"),
+                    "prefix_hit": last("prefix_hit"), "spec_accept": last("spec_accept"),
+                    "ttft_p95": last("ttft_p95"), "tpot_p95": last("tpot_p95"),
                     "gen_tokens_total": cur.get("gen_tokens"),
                     "prompt_tokens_total": cur.get("prompt_tokens"),
                     "preemptions": cur.get("preemptions"),
@@ -1517,8 +1517,11 @@ class Handler(BaseHTTPRequestHandler):
                         tpots.append(nb["tpot_p95"])
                 for k in ("running", "waiting", "kv_perc", "gen_rate", "prompt_rate",
                           "tpot_p95", "ttft_p95", "gen_tokens_total",
-                          "prompt_tokens_total", "preemptions", "finished"):
+                          "prompt_tokens_total", "preemptions", "finished",
+                          "prefix_hit", "spec_accept"):
                     row[k] = nb.get(k)
+                row["has_spec"] = t.has_spec
+                row["has_pc"] = t.has_prefix_cache
                 row["node"] = getattr(t, "node", None)
                 row["context_len"] = getattr(t, "context_len", "")
                 rows.append(row)
@@ -1771,6 +1774,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .ovtbl{width:100%;border-collapse:collapse;font-size:12px}
 .ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 5px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px}
 .ovtbl td{padding:2px 5px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35}
+#ovmachCard{padding:8px 10px 6px}
 .ovtbl tr.ovrow{cursor:pointer}
 .ovtbl tr.ovrow:hover{background:rgba(34,211,238,.06)}
 .ovtbl td.nm{color:#cfe3ff;font-weight:600}
@@ -1941,9 +1945,9 @@ canvas.chart{width:100%;height:100%;display:block}
     </div>
     </div>
     <div class="info">
-      <div class="card"><h4>机器明细（点击名称切换到该机大屏）</h4>
+      <div class="card" id="ovmachCard"><h4>机器明细（点击名称切换到该机大屏）</h4>
         <table class="ovtbl" id="tb-ovmach"><thead><tr>
-          <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>累计生成</th><th>模型</th><th>上下文</th><th>版本</th>
+          <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>缓存命中</th><th>接受率</th><th>累计生成</th><th>模型</th><th>上下文</th><th>版本</th>
         </tr></thead><tbody></tbody></table>
       </div>
     </div>
@@ -2400,6 +2404,8 @@ function renderOverview(ov){
       <td>${fmtRate(r.gen_rate)}</td><td>${fmtRate(r.prompt_rate)}</td>
       <td>${fmtInt(r.running)} / ${fmtInt(r.waiting)}</td>
       <td>${kv}</td><td>${r.tpot_p95==null?"—":fmtMs(r.tpot_p95)}</td>
+      <td>${r.has_pc&&r.prefix_hit!=null?fmtPct(r.prefix_hit):"—"}</td>
+      <td>${r.has_spec&&r.spec_accept!=null?fmtPct(r.spec_accept):"—"}</td>
       <td>${fmtTok(r.gen_tokens_total)}</td>
       <td class="mono" style="color:#cfe3ff">${esc(r.model||"—")}</td>
       <td>${r.context_len?fmtCtx(r.context_len):"—"}</td>
