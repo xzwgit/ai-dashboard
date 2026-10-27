@@ -1767,9 +1767,9 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .tab .led{width:8px;height:8px;border-radius:50%;background:#555}
 .tab .led.up{background:var(--green);box-shadow:0 0 8px var(--green)}
 .tab .led.down{background:var(--rose);box-shadow:0 0 8px var(--rose)}
-.ovtbl{width:100%;border-collapse:collapse;font-size:12.5px}
-.ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:4px 8px;border-bottom:1px solid var(--panel-border);white-space:nowrap}
-.ovtbl td{padding:5px 8px;border-bottom:1px solid rgba(120,140,200,.07);white-space:nowrap}
+.ovtbl{width:100%;border-collapse:collapse;font-size:12px}
+.ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 8px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px}
+.ovtbl td{padding:2px 8px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35}
 .ovtbl tr.ovrow{cursor:pointer}
 .ovtbl tr.ovrow:hover{background:rgba(34,211,238,.06)}
 .ovtbl td.nm{color:#cfe3ff;font-weight:600}
