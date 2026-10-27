@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "3.0.0"    # v3：网关负载均衡（vllm-router 同款策略族）+ 负载均衡总表（渠道×引擎实时）
+VERSION = "3.1.0"    # v3.1：固定总览页签（全场合计大屏：机器数/总吞吐/总并发/各机明细+对比曲线）
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
@@ -410,7 +410,7 @@ class Target:
         self.last_ts = t[i]
 
     def now_brief(self):
-        """最新指标简表（网关按引擎负载路由 / 负载均衡总表用；无数据返回 None）。"""
+        """最新指标简表（网关按引擎负载路由 / 负载均衡总表 / 全场总览用；无数据返回 None）。"""
         with self.lock:
             if not self._raw:
                 return None
@@ -425,7 +425,11 @@ class Target:
                     "waiting": cur.get("waiting"), "kv_perc": cur.get("kv_perc"),
                     "gen_rate": last("gen_rate"), "prompt_rate": last("prompt_rate"),
                     "prefix_hit": last("prefix_hit"), "ttft_p95": last("ttft_p95"),
-                    "tpot_p95": last("tpot_p95")}
+                    "tpot_p95": last("tpot_p95"),
+                    "gen_tokens_total": cur.get("gen_tokens"),
+                    "prompt_tokens_total": cur.get("prompt_tokens"),
+                    "preemptions": cur.get("preemptions"),
+                    "finished": sum(self._finished.values()) if self._finished else 0}
 
     # ---------- 输出 ----------
     def snapshot(self, maxpoints=1200):
@@ -1430,6 +1434,57 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": t.id, "name": t.name, "url": t.url, "status": t.status,
                  "last_error": t.last_error, "last_ts": t.last_ts}
                 for t in Handler.reg.targets]})
+        elif path == "/api/overview":
+            rows = []
+            tot = {"gen_rate": 0.0, "prompt_rate": 0.0, "running": 0, "waiting": 0,
+                   "gen_tokens_total": 0, "prompt_tokens_total": 0,
+                   "preemptions": 0, "finished": 0}
+            n_up = n_tot = 0
+            kv_max = None
+            kv_name = ""
+            tpots = []
+            for t in Handler.reg.targets:
+                n_tot += 1
+                nb = t.now_brief() or {}
+                row = {"id": t.id, "name": t.name, "status": t.status, "url": t.url,
+                       "model": "", "version": ""}
+                mi = t.meta_info or {}
+                if mi.get("model_ids"):
+                    row["model"] = mi["model_ids"][0]
+                elif t.model_path:
+                    row["model"] = t.model_path.rstrip("/").split("/")[-1]
+                try:
+                    v = json.loads(mi.get("version") or "")
+                    row["version"] = v.get("version", "")
+                except Exception:
+                    row["version"] = (mi.get("version") or "")[:24]
+                if t.status == "up":
+                    n_up += 1
+                    tot["gen_rate"] += nb.get("gen_rate") or 0
+                    tot["prompt_rate"] += nb.get("prompt_rate") or 0
+                    tot["running"] += nb.get("running") or 0
+                    tot["waiting"] += nb.get("waiting") or 0
+                    tot["gen_tokens_total"] += nb.get("gen_tokens_total") or 0
+                    tot["prompt_tokens_total"] += nb.get("prompt_tokens_total") or 0
+                    tot["preemptions"] += nb.get("preemptions") or 0
+                    tot["finished"] += nb.get("finished") or 0
+                    if nb.get("kv_perc") is not None and (kv_max is None or nb["kv_perc"] > kv_max):
+                        kv_max = nb["kv_perc"]
+                        kv_name = t.name
+                    if nb.get("tpot_p95") is not None:
+                        tpots.append(nb["tpot_p95"])
+                for k in ("running", "waiting", "kv_perc", "gen_rate", "prompt_rate",
+                          "tpot_p95", "ttft_p95", "gen_tokens_total",
+                          "prompt_tokens_total", "preemptions", "finished"):
+                    row[k] = nb.get(k)
+                rows.append(row)
+            tot["tpot_p95"] = (sum(tpots) / len(tpots)) if tpots else None
+            gw = None
+            if Handler.gw:
+                gw = {"enabled": Handler.gw.enabled, "port": Handler.gw_port,
+                      "policy": Handler.gw.data.get("policy", "weight")}
+            self._json({"targets": rows, "n_up": n_up, "n_total": n_tot,
+                        "totals": tot, "kv_max": kv_max, "kv_max_name": kv_name, "gw": gw})
         elif path == "/api/gateway":
             if Handler.gw:
                 self._json(Handler.gw.snapshot(Handler.gw_port))
@@ -1665,6 +1720,12 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .tab .led{width:8px;height:8px;border-radius:50%;background:#555}
 .tab .led.up{background:var(--green);box-shadow:0 0 8px var(--green)}
 .tab .led.down{background:var(--rose);box-shadow:0 0 8px var(--rose)}
+.ovtbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:4px 8px;border-bottom:1px solid var(--panel-border);white-space:nowrap}
+.ovtbl td{padding:5px 8px;border-bottom:1px solid rgba(120,140,200,.07);white-space:nowrap}
+.ovtbl tr.ovrow{cursor:pointer}
+.ovtbl tr.ovrow:hover{background:rgba(34,211,238,.06)}
+.ovtbl td.nm{color:#cfe3ff;font-weight:600}
 .spacer{flex:1}
 .clock{font-size:14px;color:#9fb4e8;letter-spacing:.5px}
 .clock small{color:var(--dim);margin-left:8px}
@@ -1797,6 +1858,30 @@ canvas.chart{width:100%;height:100%;display:block}
 </header>
   <div id="banner"></div>
 
+  <div id="mainOv" style="display:none">
+    <div class="zone">
+      <div class="zleft">
+        <div class="card modelcard"><h4>全场总览</h4><table id="tb-ovsum"></table></div>
+        <div class="kpis" id="ovKpis"></div>
+      </div>
+    </div>
+    <div class="charts">
+      <div class="panel"><h3>Decode 吞吐（合计）<span class="legend" id="lg-ovdec"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovdec"></canvas></div></div>
+      <div class="panel"><h3>Prefill 吞吐（合计）<span class="legend" id="lg-ovpre"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovpre"></canvas></div></div>
+      <div class="panel"><h3>并发请求（合计）<span class="legend" id="lg-ovcc"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovcc"></canvas></div></div>
+      <div class="panel"><h3>累计 Decode（各机对比）<span class="legend" id="lg-ovcum"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovcum"></canvas></div></div>
+    </div>
+    <div class="info">
+      <div class="card" style="flex:2.4"><h4>机器明细（点击名称切换到该机大屏）</h4>
+        <table class="ovtbl" id="tb-ovmach"><thead><tr>
+          <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>累计生成</th><th>模型 / 版本</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card"><h4>全场累计</h4><table id="tb-ovtotal"></table></div>
+    </div>
+  </div>
+
+  <div id="mainSingle">
   <div class="zone">
     <div class="zleft">
       <div class="card modelcard"><h4>模型 / 接入信息</h4><table id="tb-model"></table></div>
@@ -1820,6 +1905,7 @@ canvas.chart{width:100%;height:100%;display:block}
     <div class="card"><h4>请求统计</h4><table id="tb-req"></table></div>
     <div class="card"><h4>目标信息</h4><table id="tb-info"></table></div>
     <div class="card"><h4>累计量</h4><table id="tb-total"></table></div>
+  </div>
   </div>
 </div>
 
@@ -1894,7 +1980,8 @@ canvas.chart{width:100%;height:100%;display:block}
 <script>
 "use strict";
 /* ---------------- 全局状态 ---------------- */
-let targets=[], activeId=null, rangeMin=15, data=null, timer=null;
+const OV="__ov__";   // 固定总览页签（不可移除，始终第一位）
+let targets=[], activeId=OV, rangeMin=15, data=null, timer=null, ovData=null, ovSeries=null;
 
 const $=id=>document.getElementById(id);
 const fmtInt=v=>v==null?"—":Math.round(v).toLocaleString("en-US");
@@ -2073,6 +2160,12 @@ function buildCharts(){
     {key:"queue_p95",label:"排队 p95",color:"#38bdf8"}],
     {fmt:fmtMs,axisFmt:fmtMs,logY:true});
   CH["ch-lat"].cfg.fmt=fmtMs;
+  mk("ch-ovdec","lg-ovdec",[{key:"gen_rate",label:"Decode 合计 tok/s",color:"#22d3ee",fill:true}]);
+  mk("ch-ovpre","lg-ovpre",[{key:"prompt_rate",label:"Prefill 合计 tok/s",color:"#a78bfa",fill:true}]);
+  mk("ch-ovcc","lg-ovcc",[
+    {key:"running",label:"运行中",color:"#60a5fa",fill:true},
+    {key:"waiting",label:"排队",color:"#fbbf24",fill:true}]);
+  mk("ch-ovcum","lg-ovcum",[]);
 }
 function drawSpark(id,key){
   const el=$(id);if(!el||!data)return;const col=data.series[key]||[];
@@ -2092,12 +2185,13 @@ async function pollTargets(){
   try{
     const r=await fetch("/api/targets");const j=await r.json();
     targets=j.targets||[];
+    if(activeId!==OV&&!targets.some(t=>t.id===activeId))activeId=OV;
     renderTabs();
-    if(!activeId&&targets.length)activeId=targets[0].id;
   }catch(e){}
 }
 async function pollData(){
-  if(!activeId||document.hidden)return;
+  if(document.hidden)return;
+  if(activeId===OV){pollOverview();return;}
   try{
     const r=await fetch("/api/data?id="+encodeURIComponent(activeId)+"&maxpoints=1500");
     data=await r.json();
@@ -2105,19 +2199,129 @@ async function pollData(){
     render();
   }catch(e){}
 }
+function switchView(){
+  const ov=activeId===OV;
+  $("mainOv").style.display=ov?"block":"none";
+  $("mainSingle").style.display=ov?"none":"block";
+  if(ov)$("banner").style.display="none";
+}
 function renderTabs(){
   const box=$("tabs");box.innerHTML="";
+  const ov=document.createElement("div");
+  const allUp=targets.length>0&&targets.every(t=>t.status==="up");
+  ov.className="tab"+(activeId===OV?" active":"");
+  ov.innerHTML=`<span class="led ${targets.length?(allUp?"up":"down"):""}"></span><span class="nm">总览</span>`;
+  ov.title="全场总览（固定）";
+  ov.onclick=()=>{activeId=OV;renderTabs();pollData();};
+  box.appendChild(ov);
   for(const t of targets){
     const el=document.createElement("div");
     el.className="tab"+(t.id===activeId?" active":"");
     el.innerHTML=`<span class="led ${t.status}"></span><span class="nm">${t.name}</span><span class="x" title="移除">✕</span>`;
     el.onclick=e=>{
       if(e.target.classList.contains("x")){
-        if(confirm("移除目标 "+t.name+"？")){fetch("/api/targets/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:t.id})}).then(()=>{if(activeId===t.id)activeId=null;pollTargets();});}
+        if(confirm("移除目标 "+t.name+"？")){fetch("/api/targets/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:t.id})}).then(()=>{if(activeId===t.id)activeId=OV;pollTargets();});}
         return;}
       activeId=t.id;renderTabs();pollData();};
     box.appendChild(el);
   }
+  switchView();
+}
+/* ---------------- 全场总览（固定第一页签） ---------------- */
+function sumSeries(list,key){
+  if(!list.length)return {t:[],v:[]};
+  let n=Infinity,bestT=[];
+  for(const s of list){
+    n=Math.min(n,(s[key]||[]).length);
+    if((s.t||[]).length>bestT.length)bestT=s.t;
+  }
+  if(!isFinite(n)||n<2)return {t:[],v:[]};
+  const out=[];
+  for(let i=0;i<n;i++){
+    let sum=0,got=false;
+    for(const s of list){const val=(s[key]||[])[i];if(val!=null){sum+=val;got=true;}}
+    out.push(got?sum:null);
+  }
+  return {t:bestT.slice(bestT.length-n),v:out};
+}
+async function pollOverview(){
+  let ov=null;
+  try{const r=await fetch("/api/overview");ov=await r.json();}catch(e){}
+  if(!ov)return;
+  ovData=ov;
+  // 并行拉各机 series，做合计/对比曲线
+  const res=await Promise.all(targets.map(t =>
+    fetch("/api/data?id="+encodeURIComponent(t.id)+"&maxpoints=900").then(r=>r.json()).catch(()=>null)));
+  const sers=res.filter(d=>d&&d.series&&d.series.t);
+  ovSeries=sers;
+  if(activeId===OV){
+    const dec=sumSeries(sers,"gen_rate"),pre=sumSeries(sers,"prompt_rate"),
+          run=sumSeries(sers,"running"),wait=sumSeries(sers,"waiting");
+    CH["ch-ovdec"].setData(dec.t,{gen_rate:dec.v});
+    CH["ch-ovpre"].setData(pre.t,{prompt_rate:pre.v});
+    CH["ch-ovcc"].setData(run.t,{running:run.v,waiting:wait.v});
+    // 各机累计 Decode 对比（每机一条线，key=目标 id）
+    const cumCfg=[],cumMap={};
+    for(const d of sers){
+      const col=["#22d3ee","#a78bfa","#34d399","#fbbf24","#fb7185","#38bdf8","#f472b6","#facc15"];
+      cumCfg.push({key:d.id,label:d.name,color:col[cumCfg.length%col.length]});
+      cumMap[d.id]=d.series.gen_tokens_total||[];
+    }
+    const cumT=(sers[0]&&sers[0].series.t)||[];
+    let cumN=Infinity;for(const k in cumMap)cumN=Math.min(cumN,cumMap[k].length);
+    if(!isFinite(cumN))cumN=0;
+    const mm={};for(const c of cumCfg)mm[c.key]=(cumMap[c.key]||[]).slice(cumMap[c.key].length-cumN);
+    const ct=(sers[0].series.t||[]).slice(cumT.length-cumN);
+    if(JSON.stringify(CH["ch-ovcum"].cfg.series.map(s=>s.key))!==JSON.stringify(cumCfg.map(s=>s.key))){
+      CH["ch-ovcum"].cfg.series=cumCfg;
+      $("lg-ovcum").innerHTML=cumCfg.map(s=>`<span><i style="background:${s.color}"></i>${esc(s.label)}</span>`).join("");
+    }
+    CH["ch-ovcum"].setData(ct,mm);
+    renderOverview(ov);
+  }
+}
+function renderOverview(ov){
+  const t=ov.totals;
+  const downs=ov.targets.filter(x=>x.status!=="up").map(x=>x.name);
+  const kpis=[
+    {lbl:"引擎机器",val:ov.n_up+" / "+ov.n_total,unit:"台在线",sub:downs.length?("离线: "+downs.join(", ")):"全部在线",
+     cls:downs.length?"c-rose":"c-green"},
+    {lbl:"Decode 吞吐 合计",val:fmtRate(t.gen_rate),unit:"tok/s",sub:"全场 "+ov.n_up+" 台求和",cls:"c-cyan"},
+    {lbl:"Prefill 吞吐 合计",val:fmtRate(t.prompt_rate),unit:"tok/s",cls:"c-violet"},
+    {lbl:"运行中请求 合计",val:fmtInt(t.running),unit:"路",sub:"排队 "+fmtInt(t.waiting)+" 路",cls:"c-blue"},
+    {lbl:"KV Cache 最高",val:ov.kv_max==null?"—":fmtPct(ov.kv_max),unit:"",
+     sub:ov.kv_max_name?("最高: "+ov.kv_max_name):"",cls:(ov.kv_max!=null&&ov.kv_max>=0.9)?"c-rose":"c-green"},
+    {lbl:"TPOT p95 均值",val:t.tpot_p95==null?"—":fmtMs(t.tpot_p95),unit:"",sub:"各机 p95 平均",cls:"c-amber"}];
+  $("ovKpis").innerHTML=kpis.map(k=>`
+    <div class="kpi ${k.cls||""}"><div class="lbl"><span>${k.lbl}</span></div>
+    <div class="val">${k.val}${k.unit?`<span class="unit">${k.unit}</span>`:""}</div>
+    <div class="sub">${esc(k.sub||"")}</div></div>`).join("");
+  $("tb-ovsum").innerHTML=`
+   <tr><td>监控目标</td><td>${ov.n_total} 个（${ov.n_up} 在线）</td></tr>
+   <tr><td>在线机器</td><td>${esc(ov.targets.filter(x=>x.status==="up").map(x=>x.name).join("、")||"—")}</td></tr>
+   ${ov.gw?`<tr><td>API 网关</td><td>${ov.gw.enabled?"<span style='color:#6ee7b7'>运行中 ✓</span>":"已暂停"} · 端口 ${ov.gw.port} · 策略 ${{weight:"加权随机",round_robin:"轮询",p2c:"P2C",least_requests:"最少负载"}[ov.gw.policy]||ov.gw.policy}</td></tr>`
+          :`<tr><td>API 网关</td><td>未启用（--gw）</td></tr>`}
+   <tr><td>汇总口径</td><td>吞吐/并发为各机求和；TPOT 为各机 p95 平均；KV 取最高</td></tr>`;
+  const tb=$("tb-ovmach").querySelector("tbody");
+  tb.innerHTML=ov.targets.map(r=>{
+    const kv=r.kv_perc==null?"—":fmtPct(r.kv_perc);
+    return `<tr class="ovrow" data-id="${r.id}">
+      <td><span class="led ${r.status}"></span></td>
+      <td class="nm">${esc(r.name)}</td>
+      <td>${fmtRate(r.gen_rate)}</td><td>${fmtRate(r.prompt_rate)}</td>
+      <td>${fmtInt(r.running)} / ${fmtInt(r.waiting)}</td>
+      <td>${kv}</td><td>${r.tpot_p95==null?"—":fmtMs(r.tpot_p95)}</td>
+      <td>${fmtTok(r.gen_tokens_total)}</td>
+      <td class="mono" style="color:var(--dim)">${esc(r.model||"—")}${r.version?" · "+esc(r.version):""}</td>
+    </tr>`;}).join("");
+  tb.onclick=e=>{
+    const tr=e.target.closest("tr.ovrow");if(!tr)return;
+    activeId=tr.dataset.id;renderTabs();pollData();};
+  $("tb-ovtotal").innerHTML=`
+   <tr><td>累计生成 token</td><td>${fmtTok(t.gen_tokens_total)}</td></tr>
+   <tr><td>累计预填充 token</td><td>${fmtTok(t.prompt_tokens_total)}</td></tr>
+   <tr><td>已完成请求</td><td>${fmtInt(t.finished)}</td></tr>
+   <tr><td>KV 抢占次数</td><td>${fmtInt(t.preemptions)}</td></tr>`;
 }
 function render(){
   const d=data;if(!d)return;
