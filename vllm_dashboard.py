@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "3.1.1"    # v3.1.1：固定主屏页签更名（原"总览"）；v3.1：全场合计大屏（机器数/总吞吐/总并发/各机明细+对比曲线）
+VERSION = "3.2.0"    # v3.2：主屏右侧服务器列表（引擎简况卡，点击切换）；v3.1.1：主屏更名；v3.1：固定主屏（全场合计）
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
@@ -1749,6 +1749,15 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
   gap:10px;align-content:start;justify-content:start}
 .nodes{display:grid;grid-template-columns:minmax(240px,1fr);gap:12px;
   flex:1 1 340px;min-width:300px;align-content:start}
+.ovright{flex:1 1 300px;min-width:280px;max-height:360px;display:flex}
+.ovright .card{flex:1;max-height:360px;overflow-y:auto}
+.ovnode{padding:8px 10px;border:1px solid var(--panel-border);border-radius:10px;margin-bottom:8px;
+  background:rgba(15,23,42,.35);cursor:pointer}
+.ovnode:hover{border-color:rgba(34,211,238,.4)}
+.ovnode .ovhead{display:flex;align-items:center;gap:7px;font-size:13.5px;margin-bottom:4px}
+.ovnode .ovhead b{color:#cfe3ff}
+.ovnode .dim{color:var(--dim);font-size:11.5px}
+.ovnode .ln{font-size:12.5px;color:#aebfe6;margin:2px 0}
 @media (max-width:1280px){.kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));flex:1 1 100%}}
 .kpi{background:var(--panel);border:1px solid var(--panel-border);border-radius:13px;
   padding:9px 12px 7px;backdrop-filter:blur(8px);position:relative;overflow:hidden;transition:border-color .3s}
@@ -1863,6 +1872,9 @@ canvas.chart{width:100%;height:100%;display:block}
       <div class="zleft">
         <div class="card modelcard"><h4>全场总览</h4><table id="tb-ovsum"></table></div>
         <div class="kpis" id="ovKpis"></div>
+      </div>
+      <div class="ovright">
+        <div class="card"><h4>服务器列表（引擎简况，点击切换）</h4><div id="ovNodes"></div></div>
       </div>
     </div>
     <div class="charts">
@@ -2302,6 +2314,20 @@ function renderOverview(ov){
    ${ov.gw?`<tr><td>API 网关</td><td>${ov.gw.enabled?"<span style='color:#6ee7b7'>运行中 ✓</span>":"已暂停"} · 端口 ${ov.gw.port} · 策略 ${{weight:"加权随机",round_robin:"轮询",p2c:"P2C",least_requests:"最少负载"}[ov.gw.policy]||ov.gw.policy}</td></tr>`
           :`<tr><td>API 网关</td><td>未启用（--gw）</td></tr>`}
    <tr><td>汇总口径</td><td>吞吐/并发为各机求和；TPOT 为各机 p95 平均；KV 取最高</td></tr>`;
+  $("ovNodes").innerHTML=ov.targets.map(r=>{
+    const host=((r.url||"").replace(/^https?:\/\//,"")
+      .replace(/^(127\.0\.0\.1|localhost)(:|\/|$)/,location.hostname+"$2"));
+    const kv=r.kv_perc==null?"—":fmtPct(r.kv_perc);
+    return `<div class="ovnode" data-id="${r.id}">
+      <div class="ovhead"><span class="led ${r.status}"></span><b>${esc(r.name)}</b>
+        <span class="dim mono">${esc(host)}</span></div>
+      <div class="ln">运行 ${fmtInt(r.running)} / 排队 ${fmtInt(r.waiting)} 路 · Decode ${fmtRate(r.gen_rate)} tok/s · Prefill ${fmtRate(r.prompt_rate)}</div>
+      <div class="ln">KV ${kv} · TPOT p95 ${r.tpot_p95==null?"—":fmtMs(r.tpot_p95)} · 累计生成 ${fmtTok(r.gen_tokens_total)} tok</div>
+      <div class="ln dim">${esc(r.model||"—")}${r.version?" · vLLM "+esc(r.version):""}</div>
+    </div>`;}).join("")||`<div class="dim" style="padding:10px">暂无监控目标（⚙ → ＋ 添加监控目标）</div>`;
+  $("ovNodes").onclick=e=>{
+    const nd=e.target.closest(".ovnode");if(!nd)return;
+    activeId=nd.dataset.id;renderTabs();pollData();};
   const tb=$("tb-ovmach").querySelector("tbody");
   tb.innerHTML=ov.targets.map(r=>{
     const kv=r.kv_perc==null?"—":fmtPct(r.kv_perc);
