@@ -1769,9 +1769,8 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .tab .led.up{background:var(--green);box-shadow:0 0 8px var(--green)}
 .tab .led.down{background:var(--rose);box-shadow:0 0 8px var(--rose)}
 .ovtbl{width:100%;border-collapse:collapse;font-size:12px}
-.ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 8px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px}
-.ovtbl td{padding:2px 8px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35}
-.ovtbl td:last-child{min-width:238px}
+.ovtbl th{color:var(--dim);font-weight:400;text-align:left;padding:3px 5px 2px;border-bottom:1px solid var(--panel-border);white-space:nowrap;font-size:11px}
+.ovtbl td{padding:2px 5px;border-bottom:1px solid rgba(120,140,200,.06);white-space:nowrap;line-height:1.35}
 .ovtbl tr.ovrow{cursor:pointer}
 .ovtbl tr.ovrow:hover{background:rgba(34,211,238,.06)}
 .ovtbl td.nm{color:#cfe3ff;font-weight:600}
@@ -1944,7 +1943,7 @@ canvas.chart{width:100%;height:100%;display:block}
     <div class="info">
       <div class="card"><h4>机器明细（点击名称切换到该机大屏）</h4>
         <table class="ovtbl" id="tb-ovmach"><thead><tr>
-          <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>累计生成</th><th>模型 / 版本</th>
+          <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>累计生成</th><th>模型</th><th>上下文</th><th>版本</th>
         </tr></thead><tbody></tbody></table>
       </div>
     </div>
@@ -2402,7 +2401,9 @@ function renderOverview(ov){
       <td>${fmtInt(r.running)} / ${fmtInt(r.waiting)}</td>
       <td>${kv}</td><td>${r.tpot_p95==null?"—":fmtMs(r.tpot_p95)}</td>
       <td>${fmtTok(r.gen_tokens_total)}</td>
-      <td class="mono" style="color:var(--dim)" title="${esc((r.model||"—")+(r.context_len?" · ctx "+esc(r.context_len):"")+(r.version?" · vLLM "+esc(r.version):""))}">${esc(r.model||"—")}${r.context_len?" · "+fmtCtx(r.context_len)+" ctx":""}${r.version?" · vLLM "+esc(r.version):""}</td>
+      <td class="mono" style="color:#cfe3ff">${esc(r.model||"—")}</td>
+      <td>${r.context_len?fmtCtx(r.context_len):"—"}</td>
+      <td class="mono" style="color:var(--dim)">${r.version?esc(r.version):"—"}</td>
     </tr>`;}).join("");
   tb.onclick=e=>{
     const tr=e.target.closest("tr.ovrow");if(!tr)return;
