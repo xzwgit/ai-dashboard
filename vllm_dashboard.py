@@ -1873,6 +1873,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .ovlay{position:relative;display:flex;align-items:flex-start}
 #lg-ovcum{display:none}   # 机器多时图例占空间，隐藏（悬停仍显示每线名称）
 #mainOv .charts{grid-template-columns:repeat(2,minmax(0,1fr))}
+#mainSingle .charts{grid-template-columns:repeat(3,minmax(0,1fr))}
 #ovKpis{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));justify-content:stretch}
 .ovL{flex:1;min-width:0;margin-right:350px}
 .ovR{position:absolute;top:0;right:0;bottom:0;width:338px;display:flex}
@@ -1931,6 +1932,7 @@ canvas.chart{width:100%;height:100%;display:block}
 .card td:first-child{width:34%;white-space:nowrap}
 .card td:last-child{text-align:left;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #tb-ovsum td:first-child{width:86px}
+#tb-model td:first-child,#tb-req td:first-child,#tb-info td:first-child,#tb-total td:first-child{width:112px}
 .card .mono{font-family:Consolas,Menlo,monospace;font-size:11.5px;color:#9fb4e8}
 
 /* ---- modal ---- */
@@ -2373,9 +2375,9 @@ function renderTabs(){
   if(targets.length){
     const sel=document.createElement("select");
     sel.className="tsel";
-    sel.innerHTML=targets.map(t=>
-      `<option value="${t.id}" ${t.id===activeId?"selected":""}>${t.status==="up"?"●":"○"} ${esc(t.name)}</option>`).join("");
-    sel.onchange=()=>{activeId=sel.value;renderTabs();pollData();};
+    sel.innerHTML=(activeId===OV?`<option value="" selected disabled>—— 选择服务 ——</option>`:"")+
+      targets.map(t=>`<option value="${t.id}" ${t.id===activeId?"selected":""}>${t.status==="up"?"●":"○"} ${esc(t.name)}</option>`).join("");
+    sel.onchange=()=>{if(!sel.value)return;activeId=sel.value;renderTabs();pollData();};
     box.appendChild(sel);
     const del=document.createElement("span");
     del.className="tbtn danger";del.textContent="✕ 移除";del.title="移除当前选中的服务";
