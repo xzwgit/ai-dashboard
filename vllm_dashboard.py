@@ -544,12 +544,15 @@ class NodeCollector:
         self.has_proc = os.path.exists("/proc/stat")
         self.has_gpu = self._gpu_ok()
         self.series = {"t": [], "cpu": [], "mem_perc": [], "gpu_util": [], "gpu_mem_perc": []}
+        self.power_w = None         # 整机功率（ipmitool 后台采样；无权限/无工具=None）
+        self.power_ts = 0.0
         self.per_gpu = []
         self._cpu_prev = None
         self._stop = threading.Event()
         if self.has_proc or self.has_gpu:
             self._prime()
             threading.Thread(target=self._loop, daemon=True).start()
+        threading.Thread(target=self._power_loop, daemon=True).start()
 
     @property
     def available(self):
@@ -685,6 +688,35 @@ class NodeCollector:
                           "gpu_mem_used": getattr(self, "_last_gpu_mem", (0, 0))[0],
                           "gpu_mem_total": getattr(self, "_last_gpu_mem", (0, 0))[1]}
 
+    def _power_loop(self):
+        """整机功率后台采样：ipmitool dcmi 优先、sdr 兜底，优先取非零值；10s 一轮（子进程慢，独立线程不卡主循环）。"""
+        while not self._stop.wait(10):
+            try:
+                w = self._sample_power()
+                if w is not None:
+                    self.power_w = w
+                    self.power_ts = time.time()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _sample_power():
+        best = None
+        for args in (["dcmi", "power reading"], ["sdr", "type", "Power"]):
+            try:
+                r = subprocess.run(["ipmitool"] + args, capture_output=True, timeout=8)
+                for ln in r.stdout.decode("utf-8", "replace").splitlines():
+                    m2 = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*Watts?", ln)
+                    if m2:
+                        w = float(m2.group(1))
+                        if w > 0:
+                            return w
+                        if best is None:
+                            best = w
+            except Exception:
+                continue
+        return best
+
     def _loop(self):
         while not self._stop.wait(self.interval):
             try:
@@ -701,6 +733,7 @@ class NodeCollector:
                 "cpu_cores": getattr(self, "cpu_cores", 0), "time": time.time(),
                 "has_proc": self.has_proc, "has_gpu": self.has_gpu,
                 "gpu_name": getattr(self, "gpu_name", ""), "uptime_s": self._uptime(),
+                "power_w": self.power_w, "power_ts": self.power_ts,
                 "now": getattr(self, "_last", {}), "per_gpu": self.per_gpu,
                 "series": s}
 
@@ -2634,7 +2667,7 @@ function renderOverview(ov){
       ${n?`
       <div class="ln">CPU ${nw.cpu!=null?Math.round(nw.cpu):"—"}% · ${esc(cn||"?")} · ${n.cpu_cores||"?"} 核</div>
       <div class="ln">GPU ${nw.gpu_util!=null?Math.round(nw.gpu_util):"—"}% · ${esc(gn||"—")}${n.per_gpu&&n.per_gpu.length?" × "+n.per_gpu.length:""}</div>
-      <div class="ln">内存 ${mem}</div>
+      <div class="ln">内存 ${mem}${n.power_w!=null?" · 功率 "+Math.round(n.power_w)+"W":""}</div>
       <div class="ln dim">${esc(osn||"—")} · 运行 ${fmtUp(n.uptime_s)}</div>`
       :`<div class="ln dim">宿主机信息未接入（在该机 :8124 跑一个同款大屏实例即自动接入 CPU/GPU/内存）</div>`}
     </div>`;}).join("")||`<div class="dim" style="padding:10px">暂无监控目标（⚙ → ＋ 添加监控目标）</div>`;
@@ -3011,6 +3044,7 @@ function renderNode(){
    <tr><td>CPU 型号</td><td class="mono">${esc(n.cpu_name||"—")}${n.cpu_cores?" / "+n.cpu_cores+" 核":""}</td></tr>
    <tr><td>CPU 使用率</td><td>${n.has_proc&&now.cpu!=null?now.cpu.toFixed(1)+"%"+ibar(now.cpu,70,90):"—"}</td></tr>
    <tr><td>GPU 利用率</td><td>${n.has_gpu&&now.gpu_util!=null?now.gpu_util.toFixed(1)+"%"+ibar(now.gpu_util,70,95):"—"}</td></tr>
+   <tr><td>整机功率</td><td>${n.power_w!=null?Math.round(n.power_w)+" W":"—"}</td></tr>
    <tr><td>GPU 型号 / 数量</td><td class="mono">${esc(n.gpu_name||"—")}${nG?" / "+nG+" 卡":""}</td></tr>
    <tr><td>系统</td><td class="mono">${esc(n.os_pretty||String(n.platform||"").slice(0,52)||"—")}</td></tr>
    <tr><td>内核</td><td class="mono">${esc(n.kernel||"—")}</td></tr>`;
