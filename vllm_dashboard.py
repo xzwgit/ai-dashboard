@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "2.1.0"    # v2.1：会话亲和策略 + 主屏大版（AI服务详情/掉线报警/下拉页签/KPI 9卡）+ 交互与布局打磨；v1 纯监控见 vllm_dashboard_v1.py
+VERSION = "2.1.1"    # v2.1.1：小屏打磨（图表3+2/KPI铺满/文本左对齐/下拉首点修复/占位文案）；v1 纯监控见 vllm_dashboard_v1.py
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
