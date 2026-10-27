@@ -11,15 +11,20 @@
 #
 # 一键式（不先落脚本）:
 #   curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v2
+#   （raw 被墙时先落脚本可改走：https://github.com/xzwgit/vllm-dashboard/raw/master/install.sh）
+#
+# 下载源自动回退（无需配置）: raw tag → raw master 冻结副本 → GitHub API(tag) → GitHub API(master)。
+# raw.githubusercontent.com 不可达的网络上会自动落到 api.github.com（国内常见形态）。
 #
 # 环境变量:
-#   VD_PROXY=<镜像前缀>   raw.githubusercontent.com 不通时加代理前缀，如:
+#   VD_PROXY=<镜像前缀>   所有 GitHub 请求加代理前缀，如:
 #                         VD_PROXY=https://mirror.ghproxy.com ./install.sh v2
-#   VD_BASE=<base>        整体换源（默认 https://raw.githubusercontent.com/xzwgit/llm-test；换仓库/本地测试用）
+#   VD_BASE=<base>        raw 换源（默认 https://raw.githubusercontent.com/xzwgit/vllm-dashboard；测试用）
+#   VD_API_BASE=<base>    GitHub API 换源（默认 https://api.github.com/repos/xzwgit/vllm-dashboard；测试用）
 set -euo pipefail
 
 REPO_BASE="${VD_BASE:-https://raw.githubusercontent.com/xzwgit/vllm-dashboard}"
-API_TAGS="https://api.github.com/repos/xzwgit/vllm-dashboard/tags"
+API_BASE="${VD_API_BASE:-https://api.github.com/repos/xzwgit/vllm-dashboard}"
 DEST_NAME="vllm_dashboard.py"
 
 say() { printf '%s\n' "$*"; }
@@ -44,8 +49,8 @@ full_url() { printf '%s%s' "${VD_PROXY:-}" "$1"; }
 
 do_list() {
   local tmp; tmp=$(mktemp)
-  if ! fetch "$API_TAGS" "$tmp"; then
-    die "拉取版本列表失败（GitHub API 不可达？可用 VD_PROXY 换源，或直接 ./install.sh v1|v2）"
+  if ! fetch "$(full_url "$API_BASE/tags")" "$tmp"; then
+    die "拉取版本列表失败（GitHub API 不可达？可设 VD_PROXY 换源，或直接 ./install.sh v1|v2）"
   fi
   local tags
   tags=$(grep -oE '"name"[: ]*"[^"]+"' "$tmp" | sed 's/.*"\(.*\)"$/\1/' || true)
@@ -60,28 +65,25 @@ do_list() {
   fi
 }
 
-# 解析版本参数 → 主 URL / 回退 URL / 说明
+# 解析版本参数 → (REF, FILE) 主来源 / (FB_REF, FB_FILE) 回退来源
 resolve() {
   local v="$1"
+  FILE="$DEST_NAME"
   case "$v" in
     v1)
-      URL="$REPO_BASE/v1.0.0/vllm_dashboard.py"
-      FALLBACK="$REPO_BASE/master/vllm_dashboard_v1.py"
+      REF="v1.0.0"; FB_REF="master"; FB_FILE="vllm_dashboard_v1.py"
       DESC="v1（纯监控大屏）"
       ;;
     v2)
-      URL="$REPO_BASE/v2.0.0/vllm_dashboard.py"
-      FALLBACK="$REPO_BASE/master/vllm_dashboard.py"
+      REF="v2.0.0"; FB_REF="master"; FB_FILE="vllm_dashboard.py"
       DESC="v2（监控 + API 分发网关）"
       ;;
     latest)
-      URL="$REPO_BASE/master/vllm_dashboard.py"
-      FALLBACK=""
+      REF="master"; FB_REF=""; FB_FILE=""
       DESC="latest（master 开发版，可能不稳定）"
       ;;
     v[0-9]*)
-      URL="$REPO_BASE/$v/vllm_dashboard.py"
-      FALLBACK=""
+      REF="$v"; FB_REF=""; FB_FILE=""
       DESC="$v（指定 tag）"
       ;;
     *)
@@ -90,6 +92,28 @@ resolve() {
       ;;
   esac
 }
+
+try_raw() { # try_raw <ref> <file>
+  fetch "$(full_url "$REPO_BASE/$1/$2")" "$TMP"
+}
+
+try_api() { # try_api <ref> <file> —— contents API 返回 base64 JSON，用 python 解码（python3 或 python）
+  [ -n "$PY_BIN" ] || return 1
+  local J; J=$(mktemp)
+  if ! fetch "$(full_url "$API_BASE/contents/$2?ref=$1")" "$J"; then rm -f "$J"; return 1; fi
+  "$PY_BIN" -c "import json,sys; d=json.load(open(sys.argv[1],'rb')); sys.exit(0 if 'content' in d and d.get('encoding')=='base64' else 1)" "$J" \
+    || { rm -f "$J"; return 1; }
+  "$PY_BIN" -c "import json,sys,base64; d=json.load(open(sys.argv[1],'rb')); open(sys.argv[2],'wb').write(base64.b64decode(d['content']))" "$J" "$TMP"
+  local rc=$?; rm -f "$J"; return $rc
+}
+
+# 探测可用的 python（python3 优先；Windows 商店的 python3 假别名跑不起来，要实测才认）
+PY_BIN=""
+for _c in python3 python; do
+  if command -v "$_c" >/dev/null 2>&1 && "$_c" -c "import sys" >/dev/null 2>&1; then
+    PY_BIN="$_c"; break
+  fi
+done
 
 [ $# -ge 1 ] || { usage; die "请指定版本：v1 / v2 / latest / vX.Y.Z / list"; }
 
@@ -103,12 +127,16 @@ TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
 SRC=""
-if fetch "$(full_url "$URL")" "$TMP"; then
-  SRC="$URL"
-elif [ -n "$FALLBACK" ] && fetch "$(full_url "$FALLBACK")" "$TMP"; then
-  SRC="$FALLBACK（回退：主地址未打 tag 或不可达）"
+if try_raw "$REF" "$FILE"; then
+  SRC="$REPO_BASE/$REF/$FILE"
+elif [ -n "$FB_REF" ] && try_raw "$FB_REF" "$FB_FILE"; then
+  SRC="$REPO_BASE/$FB_REF/$FB_FILE（回退：tag 未打或不可达）"
+elif try_api "$REF" "$FILE"; then
+  SRC="GitHub API ref=$REF（raw 被墙兜底）"
+elif [ -n "$FB_REF" ] && try_api "$FB_REF" "$FB_FILE"; then
+  SRC="GitHub API ref=$FB_REF/$FB_FILE（raw 被墙兜底）"
 else
-  die "下载失败：$URL
+  die "下载失败（raw 与 API 均不可达）：$REPO_BASE/$REF/$FILE
 可尝试: 1) VD_PROXY=<镜像前缀> $0 $1
         2) ./install.sh list 查看已发布版本（tag 是否存在/拼错）
         3) 网络直连 GitHub 的机器上先下载再 scp 过去"
@@ -132,8 +160,8 @@ say "✓ 安装完成  版本 $VER（$DESC）"
 say "  来源: $SRC"
 say "  文件: $DEST"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  say "  [提醒] 本机没有 python3，运行前需要装（工具零第三方依赖，python3.6+ 即可）"
+if [ -z "$PY_BIN" ]; then
+  say "  [提醒] 本机没有 python3/python，运行前需要装（工具零第三方依赖，Python 3.6+ 即可）"
 fi
 
 say ""

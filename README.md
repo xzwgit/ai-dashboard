@@ -58,6 +58,7 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/vllm-dashboard
 ```
 
 - **版本来源**：`v1` / `v2` 优先取 git tag（`v1.0.0` / `v2.0.0`，历史版本固定不变）；tag 不可达时自动回退 master（v1 = 冻结副本 `vllm_dashboard_v1.py`，v2 = 主文件）；`latest` = master 开发版；也支持 `./install.sh v2.0.1` 直装指定 tag。
+- **raw 被墙自动兜底**：raw.githubusercontent.com 不可达的网络（国内常见）会自动改走 api.github.com 取文件（base64 解码，无需配置；需目标机有 python3）。
 - 下载后校验 `VERSION` 常量（防代理/网关返回错误页）；覆盖旧文件前自动备份 `.bak.<旧版本>.<时间戳>`；装完按版本打印下一步启动命令。
 - GitHub 直连不通的机器：`VD_PROXY=https://mirror.ghproxy.com ./install.sh v2`（raw 地址加镜像前缀）。
 - 版本 tag 随仓库发布：`v1.0.0` 指向 v1 内容的历史提交（该提交上 `vllm_dashboard.py` 即 v1），raw 地址取 tag 即固定取到该版本。
