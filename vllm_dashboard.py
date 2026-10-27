@@ -2376,7 +2376,7 @@ function renderTabs(){
   if(targets.length){
     const sel=document.createElement("select");
     sel.className="tsel";
-    sel.innerHTML=(activeId===OV?`<option value="" selected disabled>—— 选择服务 ——</option>`:"")+
+    sel.innerHTML=(activeId===OV?`<option value="" selected disabled>—— 选择小屏 ——</option>`:"")+
       targets.map(t=>`<option value="${t.id}" ${t.id===activeId?"selected":""}>${t.status==="up"?"●":"○"} ${esc(t.name)}</option>`).join("");
     sel.onchange=()=>{if(!sel.value)return;activeId=sel.value;renderTabs();pollData();};
     box.appendChild(sel);
