@@ -1861,6 +1861,7 @@ canvas.chart{width:100%;height:100%;display:block}
 .card td{padding:3.5px 4px;color:var(--dim);vertical-align:middle}
 .card td:first-child{width:34%;white-space:nowrap}
 .card td:last-child{text-align:left;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#tb-ovsum td:first-child{width:86px}
 .card .mono{font-family:Consolas,Menlo,monospace;font-size:11.5px;color:#9fb4e8}
 
 /* ---- modal ---- */
