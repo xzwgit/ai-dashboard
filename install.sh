@@ -10,8 +10,8 @@
 #   ./install.sh v2 /opt/dash    第二参数 = 安装目录（默认当前目录），落成 <目录>/vllm_dashboard.py
 #
 # 一键式（不先落脚本）:
-#   curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v2
-#   （raw 被墙时先落脚本可改走：https://github.com/xzwgit/vllm-dashboard/raw/master/install.sh）
+#   curl -fsSL https://raw.githubusercontent.com/xzwgit/ai-dashboard/master/install.sh | bash -s v2
+#   （raw 被墙时先落脚本可改走：https://github.com/xzwgit/ai-dashboard/raw/master/install.sh）
 #
 # 下载源自动回退（无需配置）: raw tag → raw master 冻结副本 → GitHub API(tag) → GitHub API(master)。
 # raw.githubusercontent.com 不可达的网络上会自动落到 api.github.com（国内常见形态）。
@@ -19,12 +19,12 @@
 # 环境变量:
 #   VD_PROXY=<镜像前缀>   所有 GitHub 请求加代理前缀，如:
 #                         VD_PROXY=https://mirror.ghproxy.com ./install.sh v2
-#   VD_BASE=<base>        raw 换源（默认 https://raw.githubusercontent.com/xzwgit/vllm-dashboard；测试用）
-#   VD_API_BASE=<base>    GitHub API 换源（默认 https://api.github.com/repos/xzwgit/vllm-dashboard；测试用）
+#   VD_BASE=<base>        raw 换源（默认 https://raw.githubusercontent.com/xzwgit/ai-dashboard；测试用）
+#   VD_API_BASE=<base>    GitHub API 换源（默认 https://api.github.com/repos/xzwgit/ai-dashboard；测试用）
 set -euo pipefail
 
-REPO_BASE="${VD_BASE:-https://raw.githubusercontent.com/xzwgit/vllm-dashboard}"
-API_BASE="${VD_API_BASE:-https://api.github.com/repos/xzwgit/vllm-dashboard}"
+REPO_BASE="${VD_BASE:-https://raw.githubusercontent.com/xzwgit/ai-dashboard}"
+API_BASE="${VD_API_BASE:-https://api.github.com/repos/xzwgit/ai-dashboard}"
 DEST_NAME="vllm_dashboard.py"
 
 say() { printf '%s\n' "$*"; }

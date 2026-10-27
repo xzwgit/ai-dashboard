@@ -1,4 +1,4 @@
-# vllm-dashboard — vLLM 推理监控大屏
+# ai-dashboard — AI 推理性能监控大屏
 
 
 ## 界面结构（2026-10-24 终版）
@@ -46,14 +46,14 @@
 
 ## 安装（同一仓库选版本，v1/v2 并存）
 
-仓库已发布：**https://github.com/xzwgit/vllm-dashboard**（public）。在目标机器（Linux，需 curl 或 wget）上选版本安装：
+仓库已发布：**https://github.com/xzwgit/ai-dashboard**（public）。在目标机器（Linux，需 curl 或 wget）上选版本安装：
 
 ```bash
 # 一键式：装 v2（监控 + API 网关 + 负载均衡 + 主屏） / v1（纯监控大屏）
-curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v2
-curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v1
+curl -fsSL https://raw.githubusercontent.com/xzwgit/ai-dashboard/master/install.sh | bash -s v2
+curl -fsSL https://raw.githubusercontent.com/xzwgit/ai-dashboard/master/install.sh | bash -s v1
 # 或先落脚本再装（第二参数=安装目录）
-curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/ai-dashboard/master/install.sh
 ./install.sh v2 /opt/dash
 ./install.sh list      # 列出仓库已发布的版本 tag
 ```
@@ -115,7 +115,7 @@ python vllm_dashboard.py --demo
 
 ## 状态（2026-10-27）
 
-- **已发布 GitHub**：https://github.com/xzwgit/vllm-dashboard（public；**版本重排后 tag = v1.0.0 / v2.0.0 两个**；install.sh 选版本安装，raw 被墙自动 API 兜底）
+- **已发布 GitHub**：https://github.com/xzwgit/ai-dashboard（public；**版本重排后 tag = v1.0.0 / v2.0.0 两个**；install.sh 选版本安装，raw 被墙自动 API 兜底）
 - 公开仓只放：vllm_dashboard.py / vllm_dashboard_v1.py / install.sh / test_mock_openai.py / test_lb_v3.py / 脱敏 README——**rrun.py（含凭据）、各轮 boot/bench 脚本（含内网 IP）不上仓**，只留工作区
 - .158/.162 真机测试环境 2026-10-27 已清理（引擎/大屏全停，双机 GPU 0，dash_ops 留脚本+日志）
 
