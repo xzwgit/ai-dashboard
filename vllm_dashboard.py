@@ -1797,6 +1797,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .nodes{display:grid;grid-template-columns:minmax(240px,1fr);gap:12px;
   flex:1 1 340px;min-width:300px;align-content:start}
 .ovlay{display:flex;gap:12px;align-items:flex-start}
+#ovKpis{grid-template-columns:repeat(7,minmax(118px,150px))}
 .ovL{flex:1;min-width:0}
 .ovR{width:335px;flex:none;position:sticky;top:8px}
 .ovR .card{max-height:calc(100vh - 76px);overflow-y:auto}
@@ -1932,12 +1933,11 @@ canvas.chart{width:100%;height:100%;display:block}
       <div class="panel"><h3>累计 Decode（各机对比）<span class="legend" id="lg-ovcum"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovcum"></canvas></div></div>
     </div>
     <div class="info">
-      <div class="card" style="flex:2.4"><h4>机器明细（点击名称切换到该机大屏）</h4>
+      <div class="card"><h4>机器明细（点击名称切换到该机大屏）</h4>
         <table class="ovtbl" id="tb-ovmach"><thead><tr>
           <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>累计生成</th><th>模型 / 版本</th>
         </tr></thead><tbody></tbody></table>
       </div>
-      <div class="card"><h4>全场累计</h4><table id="tb-ovtotal"></table></div>
     </div>
     </div>
     <div class="ovR">
@@ -2356,7 +2356,9 @@ function renderOverview(ov){
     {lbl:"运行中请求 合计",val:fmtInt(t.running),unit:"路",sub:"排队 "+fmtInt(t.waiting)+" 路",cls:"c-blue"},
     {lbl:"KV Cache 最高",val:ov.kv_max==null?"—":fmtPct(ov.kv_max),unit:"",
      sub:ov.kv_max_name?("最高: "+ov.kv_max_name):"",cls:(ov.kv_max!=null&&ov.kv_max>=0.9)?"c-rose":"c-green"},
-    {lbl:"TPOT p95 均值",val:t.tpot_p95==null?"—":fmtMs(t.tpot_p95),unit:"",sub:"各机 p95 平均",cls:"c-amber"}];
+    {lbl:"TPOT p95 均值",val:t.tpot_p95==null?"—":fmtMs(t.tpot_p95),unit:"",sub:"各机 p95 平均",cls:"c-amber"},
+    {lbl:"全场累计生成",val:fmtTok(t.gen_tokens_total),unit:"tok",
+     sub:"完成 "+fmtInt(t.finished)+" · 预填 "+fmtTok(t.prompt_tokens_total)+" · 抢占 "+fmtInt(t.preemptions),cls:"c-cyan"}];
   $("ovKpis").innerHTML=kpis.map(k=>`
     <div class="kpi ${k.cls||""}"><div class="lbl"><span>${k.lbl}</span></div>
     <div class="val">${k.val}${k.unit?`<span class="unit">${k.unit}</span>`:""}</div>
@@ -2404,11 +2406,6 @@ function renderOverview(ov){
   tb.onclick=e=>{
     const tr=e.target.closest("tr.ovrow");if(!tr)return;
     activeId=tr.dataset.id;renderTabs();pollData();};
-  $("tb-ovtotal").innerHTML=`
-   <tr><td>累计生成 token</td><td>${fmtTok(t.gen_tokens_total)}</td></tr>
-   <tr><td>累计预填充 token</td><td>${fmtTok(t.prompt_tokens_total)}</td></tr>
-   <tr><td>已完成请求</td><td>${fmtInt(t.finished)}</td></tr>
-   <tr><td>KV 抢占次数</td><td>${fmtInt(t.preemptions)}</td></tr>`;
 }
 function render(){
   const d=data;if(!d)return;
