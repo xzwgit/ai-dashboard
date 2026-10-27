@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "2.0.0"    # v2：+内置轻量网关（API 分发）；v1 冻结副本 vllm_dashboard_v1.py
+VERSION = "3.0.0"    # v3：网关负载均衡（vllm-router 同款策略族）+ 负载均衡总表（渠道×引擎实时）
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
@@ -408,6 +408,24 @@ class Target:
         for k, v in s.items():
             self.series[k].append(v)
         self.last_ts = t[i]
+
+    def now_brief(self):
+        """最新指标简表（网关按引擎负载路由 / 负载均衡总表用；无数据返回 None）。"""
+        with self.lock:
+            if not self._raw:
+                return None
+            cur = self._raw[-1]
+
+            def last(k):
+                for v in reversed(self.series[k]):
+                    if v is not None:
+                        return v
+                return None
+            return {"status": self.status, "running": cur.get("running"),
+                    "waiting": cur.get("waiting"), "kv_perc": cur.get("kv_perc"),
+                    "gen_rate": last("gen_rate"), "prompt_rate": last("prompt_rate"),
+                    "prefix_hit": last("prefix_hit"), "ttft_p95": last("ttft_p95"),
+                    "tpot_p95": last("tpot_p95")}
 
     # ---------- 输出 ----------
     def snapshot(self, maxpoints=1200):
@@ -858,6 +876,9 @@ GW_STREAM_IDLE_TIMEOUT = 300.0    # 流式两 chunk 间空闲上限（长思考�
 GW_REQ_TIMEOUT = 600.0
 GW_BREAK_NFAIL = 3                # 连接类连续失败 N 次 → 熔断
 GW_BREAK_SECONDS = 60.0
+GW_PROBE_INTERVAL = 10.0          # 渠道主动探活间隔（GET /health）
+GW_PROBE_TIMEOUT = 3.0
+GW_LB_POLICIES = ("weight", "round_robin", "p2c", "least_requests")
 
 
 class Gateway:
@@ -870,10 +891,14 @@ class Gateway:
         self.data = {"channels": [], "keys": []}
         self.rpm_win = {}
         self.chan = {}
+        self.reqwin = {}               # 渠道 → 请求时间窗（QPS 统计）
+        self.metrics_fn = None         # base_url → 引擎指标简表（main 注入；指标感知路由/总表用）
+        self._rr = 0                   # round_robin 轮询计数
         self.totals = {"requests": 0, "ok": 0, "fail": 0, "tokens": 0}
         self.started = time.time()
         self._load()
         threading.Thread(target=self._flush_loop, daemon=True).start()
+        threading.Thread(target=self._probe_loop, daemon=True).start()
 
     def _load(self):
         if self.path and os.path.exists(self.path):
@@ -884,13 +909,17 @@ class Gateway:
                 pass
         self.data.setdefault("channels", [])
         self.data.setdefault("keys", [])
+        self.data.setdefault("policy", "weight")
+        if self.data.get("policy") not in GW_LB_POLICIES:
+            self.data["policy"] = "weight"
         for c in self.data["channels"]:
             self.chan[c["name"]] = self._blank_chan()
 
     @staticmethod
     def _blank_chan():
         return {"requests": 0, "ok": 0, "fail": 0, "tokens": 0,
-                "lat_ms": 0.0, "consec": 0, "broken_until": 0.0}
+                "lat_ms": 0.0, "consec": 0, "broken_until": 0.0,
+                "inflight": 0, "probe_ok": None, "probe_ms": 0.0, "probe_ts": 0.0}
 
     def _flush_loop(self):
         while True:
@@ -975,17 +1004,92 @@ class Gateway:
                     return True
             return False
 
+    def set_policy(self, policy):
+        with self.lock:
+            if policy not in GW_LB_POLICIES:
+                return False
+            self.data["policy"] = policy
+            self.save()
+            return True
+
+    def _probe_loop(self):
+        """渠道主动探活：GET /health；有 HTTP 应答即算在线（404 也算进程活着），连接失败才判死。"""
+        while True:
+            time.sleep(GW_PROBE_INTERVAL)
+            for c in list(self.data.get("channels", [])):
+                if not c.get("enabled", True):
+                    continue
+                t0 = time.time()
+                try:
+                    urllib.request.urlopen(c["base_url"] + "/health", timeout=GW_PROBE_TIMEOUT)
+                    ok = True
+                except urllib.error.HTTPError:
+                    ok = True
+                except Exception:
+                    ok = False
+                with self.lock:
+                    st = self.chan.setdefault(c["name"], self._blank_chan())
+                    st["probe_ok"] = ok
+                    st["probe_ms"] = round((time.time() - t0) * 1000, 1)
+                    st["probe_ts"] = time.time()
+
+    # ---------- 在途请求计数（P2C/最少负载策略与总表用） ----------
+    def chan_begin(self, name):
+        with self.lock:
+            self.chan.setdefault(name, self._blank_chan())["inflight"] = \
+                self.chan[name].get("inflight", 0) + 1
+
+    def chan_end(self, name):
+        with self.lock:
+            st = self.chan.get(name)
+            if st:
+                st["inflight"] = max(0, st.get("inflight", 0) - 1)
+
     def pick_channel(self, exclude=()):
+        """按负载均衡策略选渠道：同优先级层内分流，跨层按优先级（低者优先，留给故障转移）。
+        策略：weight=加权随机（默认） / round_robin=轮询 / p2c=随机抽二选在途少 /
+        least_requests=选引擎运行请求最少（监控指标感知，取不到用在途数）。"""
         now = time.time()
         with self.lock:
             cands = [c for c in self.data["channels"]
                      if c.get("enabled", True) and c["name"] not in exclude
                      and self.chan.get(c["name"], {}).get("broken_until", 0) <= now]
+            pol = self.data.get("policy", "weight")
         if not cands:
             return None
+        alive = [c for c in cands if self.chan.get(c["name"], {}).get("probe_ok", True)]
+        if alive:
+            cands = alive
         cands.sort(key=lambda c: c.get("priority", 1))
         p0 = cands[0].get("priority", 1)
         same = [c for c in cands if c.get("priority", 1) == p0]
+        if len(same) == 1:
+            return same[0]
+
+        def inflight(c):
+            return self.chan.get(c["name"], {}).get("inflight", 0)
+
+        if pol == "round_robin":
+            with self.lock:
+                self._rr = (self._rr + 1) % len(same)
+                return same[self._rr]
+        if pol in ("p2c", "least_requests"):
+            def load(c):
+                if pol == "least_requests" and self.metrics_fn:
+                    m = None
+                    try:
+                        m = self.metrics_fn(c["base_url"])
+                    except Exception:
+                        pass
+                    if m and m.get("running") is not None:
+                        return (m["running"], inflight(c))
+                    return (100000 + inflight(c), 0)   # 引擎指标未知 → 用在途数兜底排序
+                return (inflight(c), 0)
+            if pol == "p2c" and len(same) >= 2:
+                a, b = random.sample(same, 2)
+                return a if load(a) <= load(b) else b
+            return min(same, key=load)
+        # weight（默认）：同层加权随机
         tw = sum(c.get("weight", 10) for c in same)
         r = random.uniform(0, tw)
         acc = 0
@@ -1019,8 +1123,13 @@ class Gateway:
 
     # ---------- 记账 ----------
     def chan_hit(self, name, ok, lat_ms=0.0, tokens=0, fail_pre=False):
+        now = time.time()
         with self.lock:
             st = self.chan.setdefault(name, self._blank_chan())
+            w = self.reqwin.setdefault(name, deque())
+            w.append(now)
+            while w and w[0] < now - 60:
+                w.popleft()
             self.totals["requests"] += 1
             st["requests"] += 1
             if ok:
@@ -1048,22 +1157,45 @@ class Gateway:
                 k["used_tokens"] = k.get("used_tokens", 0) + (tokens or 0)
 
     def snapshot(self, port):
+        now = time.time()
         with self.lock:
-            now = time.time()
             chans = []
+            tot_qps = 0
+            tot_run = tot_dec = 0
+            n_eng = 0
             for c in self.data["channels"]:
                 st = self.chan.get(c["name"], self._blank_chan())
                 bu = st.get("broken_until", 0)
                 status = "paused" if not c.get("enabled", True) else ("broken" if bu > now else "ok")
                 avg = (st.get("lat_ms", 0) / st["ok"]) if st.get("ok") else 0
+                w = self.reqwin.get(c["name"])
+                qps = len(w) if w else 0
+                eng = None
+                if self.metrics_fn:
+                    try:
+                        eng = self.metrics_fn(c["base_url"])
+                    except Exception:
+                        eng = None
+                tot_qps += qps
+                if eng and eng.get("running") is not None:
+                    tot_run += eng["running"] or 0
+                    tot_dec += eng.get("gen_rate") or 0
+                    n_eng += 1
                 chans.append({"name": c["name"], "base_url": c["base_url"],
                               "priority": c.get("priority", 1), "weight": c.get("weight", 10),
                               "status": status, "broken_until": round(bu - now) if bu > now else 0,
                               "requests": st.get("requests", 0), "ok": st.get("ok", 0),
                               "fail": st.get("fail", 0), "tokens": st.get("tokens", 0),
-                              "avg_latency_ms": round(avg, 1)})
+                              "avg_latency_ms": round(avg, 1),
+                              "inflight": st.get("inflight", 0),
+                              "probe_ok": st.get("probe_ok"), "probe_ms": st.get("probe_ms", 0),
+                              "qps_1m": qps, "engine": eng})
             return {"enabled": self.enabled, "port": port, "since": self.started,
+                    "policy": self.data.get("policy", "weight"),
                     "totals": dict(self.totals), "channels": chans,
+                    "qps_1m": tot_qps,
+                    "eng_running": tot_run if n_eng else None,
+                    "eng_gen_rate": round(tot_dec, 1) if n_eng else None,
                     "keys": [dict(k) for k in self.data["keys"]]}
 
 
@@ -1172,46 +1304,48 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if ch is None:
                 break
             tried_names.append(ch["name"])
-            if ch is None:
-                break
-            t0 = time.time()
-            req = urllib.request.Request(ch["base_url"] + self.path[len("/gw"):],
-                                         data=body if method == "POST" else None,
-                                         method=method)
-            req.add_header("Content-Type", "application/json")
-            if ch.get("api_key"):
-                req.add_header("Authorization", "Bearer " + ch["api_key"])
+            gw.chan_begin(ch["name"])
             try:
-                resp = urllib.request.urlopen(
-                    req, timeout=GW_STREAM_IDLE_TIMEOUT if is_stream else GW_REQ_TIMEOUT)
-            except urllib.error.HTTPError as e:
-                ebody = b""
+                t0 = time.time()
+                req = urllib.request.Request(ch["base_url"] + self.path[len("/gw"):],
+                                             data=body if method == "POST" else None,
+                                             method=method)
+                req.add_header("Content-Type", "application/json")
+                if ch.get("api_key"):
+                    req.add_header("Authorization", "Bearer " + ch["api_key"])
                 try:
-                    ebody = e.read()
-                except Exception:
-                    pass
-                if e.code >= 502 and tried < nch:
+                    resp = urllib.request.urlopen(
+                        req, timeout=GW_STREAM_IDLE_TIMEOUT if is_stream else GW_REQ_TIMEOUT)
+                except urllib.error.HTTPError as e:
+                    ebody = b""
+                    try:
+                        ebody = e.read()
+                    except Exception:
+                        pass
+                    if e.code >= 502 and tried < nch:
+                        gw.chan_hit(ch["name"], False, fail_pre=True)
+                        last_err = "上游 HTTP %d" % e.code
+                        continue
+                    gw.chan_hit(ch["name"], False)
+                    self._passthrough(e.code, ebody,
+                                      e.headers.get("Content-Type", "application/json"))
+                    return
+                except Exception as e:
                     gw.chan_hit(ch["name"], False, fail_pre=True)
-                    last_err = "上游 HTTP %d" % e.code
+                    last_err = "%s: %s" % (type(e).__name__, e)
                     continue
-                gw.chan_hit(ch["name"], False)
-                self._passthrough(e.code, ebody,
-                                  e.headers.get("Content-Type", "application/json"))
+                try:
+                    if is_stream:
+                        self._relay_stream(resp, key, ch["name"], t0)
+                    else:
+                        self._relay_plain(resp, key, ch["name"], t0)
+                except (BrokenPipeError, ConnectionResetError):
+                    gw.chan_hit(ch["name"], True, (time.time() - t0) * 1000)
+                    self.close_connection = True
+                    return
                 return
-            except Exception as e:
-                gw.chan_hit(ch["name"], False, fail_pre=True)
-                last_err = "%s: %s" % (type(e).__name__, e)
-                continue
-            try:
-                if is_stream:
-                    self._relay_stream(resp, key, ch["name"], t0)
-                else:
-                    self._relay_plain(resp, key, ch["name"], t0)
-            except (BrokenPipeError, ConnectionResetError):
-                gw.chan_hit(ch["name"], True, (time.time() - t0) * 1000)
-                self.close_connection = True
-                return
-            return
+            finally:
+                gw.chan_end(ch["name"])
         self._api_err(502, "所有渠道不可用：%s" % last_err, "server_error")
 
     def _passthrough(self, code, body, ctype):
@@ -1371,6 +1505,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/gateway/channel/op":
                 ok = g.channel_op(payload.get("name", ""), payload.get("op", ""))
                 self._json({"ok": ok})
+            elif path == "/api/gateway/policy":
+                ok = g.set_policy(payload.get("policy", ""))
+                self._json({"ok": ok} if ok else {"ok": False, "error": "未知策略"})
             else:
                 self._json({"error": "not found"}, 404)
         elif path == "/api/targets/remove":
@@ -1434,6 +1571,15 @@ def main():
 
     if args.gw:
         gw = Gateway(args.gw_config)
+
+        def _gw_metrics(base_url):
+            # 渠道地址 ↔ 监控目标地址匹配（规范化后精确匹配）→ 引擎最新指标
+            want = base_url.rstrip("/").lower()
+            for t in reg.targets:
+                if t.url.rstrip("/").lower() == want:
+                    return t.now_brief()
+            return None
+        gw.metrics_fn = _gw_metrics
         Handler.gw = gw
         Handler.gw_port = args.gw_port
         GatewayHandler.gw = gw
@@ -1697,7 +1843,16 @@ canvas.chart{width:100%;height:100%;display:block}
     </div>
     <div id="gwBody">
       <div class="gwtop">
-        <div>状态：<b id="gwState">—</b>　端口：<span class="mono" id="gwPort">—</span>　接入地址：<span class="mono" id="gwBase">—</span></div>
+        <div>状态：<b id="gwState">—</b>　端口：<span class="mono" id="gwPort">—</span>　接入地址：<span class="mono" id="gwBase">—</span>
+          <span style="margin-left:10px">策略：
+            <select id="gwPolicy" style="background:#0b1526;color:#cfe3ff;border:1px solid rgba(34,211,238,.35);border-radius:6px;padding:2px 6px;font-size:12px">
+              <option value="weight">加权随机</option>
+              <option value="round_robin">轮询</option>
+              <option value="p2c">P2C 二选一</option>
+              <option value="least_requests">最少负载</option>
+            </select>
+          </span>
+        </div>
         <div class="gwbtns">
           <button id="gwToggleBtn">暂停转发</button>
           <button id="gwCloseBtn" style="margin-left:8px">关闭</button>
@@ -1705,10 +1860,12 @@ canvas.chart{width:100%;height:100%;display:block}
       </div>
       <div class="gwstats" id="gwStats"></div>
 
-      <h4 class="gwh">上游渠道 <span class="dim">（vLLM 服务；按优先级路由，连接失败自动转移）</span></h4>
+      <h4 class="gwh">负载均衡总表 <span class="dim">（上游渠道 × 引擎实时状态；同优先级层内按策略分流，低优先级层做故障转移）</span></h4>
       <table class="gwtable" id="gwChanT"><thead><tr>
-        <th>名称</th><th>地址</th><th>优先级/权重</th><th>状态</th><th>请求/失败</th><th>token</th><th>均延迟</th><th>操作</th>
-      </tr></thead><tbody></tbody></table>
+        <th>名称</th><th>地址</th><th>优先/权重</th><th>状态</th><th>探活</th><th>在途</th>
+        <th>请求/失败</th><th>QPS(1m)</th><th>token</th><th>均延迟</th>
+        <th>引擎: 运行/排队 · KV · Decode</th><th>操作</th>
+      </tr></thead><tbody></tbody><tfoot></tfoot></table>
       <div class="gwform" id="gwChanForm">
         <input id="gcName" placeholder="名称（如 prod-1）" style="width:120px">
         <input id="gcUrl" placeholder="http://127.0.0.1:8123" style="width:200px">
@@ -2037,6 +2194,10 @@ $("miGw").onclick=()=>{gearMenu.style.display="none";gwOpen();};
 $("gwCloseBtn").onclick=gwClose;
 $("gwModalBg").onclick=e=>{if(e.target===$("gwModalBg"))gwClose();};
 $("gwToggleBtn").onclick=async()=>{const j=await gwPost("/api/gateway/toggle");if(j.ok)gwPoll();};
+$("gwPolicy").onchange=async()=>{
+  const j=await gwPost("/api/gateway/policy",{policy:$("gwPolicy").value});
+  if(j.ok){toast("负载均衡策略已切换");}else{toast("策略设置失败");$("gwPolicy").value=gwData?gwData.policy:"weight";}
+};
 $("gcAdd").onclick=async()=>{
   const j=await gwPost("/api/gateway/channel",{name:$("gcName").value.trim(),
     url:$("gcUrl").value.trim(),api_key:$("gcKey").value.trim(),
@@ -2133,26 +2294,48 @@ function gwRender(){
   $("gwPort").textContent=g.port;
   $("gwBase").textContent="http://"+location.hostname+":"+g.port+"/gw/v1";
   $("gwToggleBtn").textContent=g.enabled?"⏸ 暂停转发":"▶ 开启转发";
+  $("gwPolicy").value=g.policy||"weight";
   const t=g.totals;
   $("gwStats").innerHTML=
     '<span class="gs"><b>'+t.requests+'</b> 总请求</span>'
     +'<span class="gs"><b>'+t.ok+'</b> 成功</span>'
     +'<span class="gs"><b>'+t.fail+'</b> 失败</span>'
-    +'<span class="gs"><b>'+fmtTok(t.tokens)+'</b> token</span>';
-  // 渠道表
+    +'<span class="gs"><b>'+fmtTok(t.tokens)+'</b> token</span>'
+    +'<span class="gs"><b>'+(g.qps_1m||0)+'</b> QPS(1m)</span>'
+    +(g.eng_running!=null?'<span class="gs"><b>'+fmtInt(g.eng_running)+'</b> 引擎运行</span>'
+      +' <span class="gs"><b>'+fmtInt(g.eng_gen_rate)+'</b> Decode tok/s 合计</span>':'');
+  // 负载均衡总表
   const tb=$("gwChanT").querySelector("tbody");tb.innerHTML="";
   for(const c of g.channels){
     const stTxt={ok:"<span style='color:#6ee7b7'>正常</span>",
                  paused:"<span style='color:#fcd34d'>已停用</span>",
                  broken:"<span style='color:#fda4af'>熔断 "+c.broken_until+"s</span>"}[c.status];
+    const pb=c.probe_ok==null?"<span style='color:#94a3b8'>探测中</span>":
+      (c.probe_ok?"<span style='color:#6ee7b7'>"+c.probe_ms+"ms</span>":
+                  "<span style='color:#fda4af'>不通</span>");
+    let eng="—<span class='dim'>（未监控）</span>";
+    if(c.engine&&c.engine.running!=null){
+      const kv=c.engine.kv_perc!=null?Math.round(c.engine.kv_perc*100)+"%":"—";
+      eng=fmtInt(c.engine.running)+" / "+fmtInt(c.engine.waiting||0)+" · "+kv+" · "
+         +fmtInt(c.engine.gen_rate||0)+" tok/s";
+    }
     const tr=document.createElement("tr");
     tr.innerHTML='<td>'+esc(c.name)+'</td><td class="mono">'+esc(c.base_url)+'</td>'
-      +'<td>'+c.priority+' / '+c.weight+'</td><td>'+stTxt+'</td>'
-      +'<td>'+c.requests+' / '+(c.fail||0)+'</td><td>'+fmtTok(c.tokens)+'</td>'
-      +'<td>'+(c.avg_latency_ms||0)+'ms</td>'
+      +'<td>'+c.priority+' / '+c.weight+'</td><td>'+stTxt+'</td><td>'+pb+'</td>'
+      +'<td>'+c.inflight+'</td>'
+      +'<td>'+c.requests+' / <span style="color:#fda4af">'+(c.fail||0)+'</span></td>'
+      +'<td>'+c.qps_1m+'</td><td>'+fmtTok(c.tokens)+'</td>'
+      +'<td>'+(c.avg_latency_ms||0)+'ms</td><td>'+eng+'</td>'
       +'<td><a class="op" data-op="toggle" data-n="'+esc(c.name)+'">'+(c.status==="paused"?"启用":"停用")+'</a> '
       +'<a class="op" data-op="delete" data-n="'+esc(c.name)+'">删除</a></td>';
     tb.appendChild(tr);
+  }
+  const tf=$("gwChanT").querySelector("tfoot");
+  if(tf&&g.channels.length){
+    tf.innerHTML='<tr><td colspan="7" style="color:var(--dim)">合计（'+g.channels.length+' 渠道）</td>'
+      +'<td>'+fmtInt(g.qps_1m||0)+'</td>'
+      +'<td>'+fmtTok(t.tokens)+'</td><td>—</td>'
+      +'<td>'+(g.eng_running!=null?fmtInt(g.eng_running)+' 路 · '+fmtInt(g.eng_gen_rate)+' tok/s':'—')+'</td><td>—</td></tr>';
   }
   // Key 表
   const kb=$("gwKeyT").querySelector("tbody");kb.innerHTML="";

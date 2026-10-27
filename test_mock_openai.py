@@ -5,8 +5,24 @@
 """
 import json
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = {"running": 0, "gen": 0, "prompt": 0}     # /metrics 用：供大屏作为监控目标抓取
+LOCK = threading.Lock()
+
+
+def _metrics_text():
+    with LOCK:
+        running, gen, prompt = STATE["running"], STATE["gen"], STATE["prompt"]
+    kv = min(0.95, 0.05 + gen / 20000.0)
+    return (("# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running %d\n"
+             "# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting 0\n"
+             "# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc %.4f\n"
+             "# TYPE vllm:generation_tokens_total counter\nvllm:generation_tokens_total %d\n"
+             "# TYPE vllm:prompt_tokens_total counter\nvllm:prompt_tokens_total %d\n")
+            % (running, kv, gen, prompt))
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -29,12 +45,30 @@ class MockHandler(BaseHTTPRequestHandler):
                 {"id": "mock-model", "object": "model", "owned_by": "mock"}]})
         elif self.path == "/health":
             self._json(200, {"ok": True})
+        elif self.path.split("?")[0] == "/metrics":
+            body = _metrics_text().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
+        with LOCK:
+            STATE["running"] += 1
+        try:
+            self._mock_post(body)
+        finally:
+            with LOCK:
+                STATE["running"] -= 1
+                STATE["gen"] += getattr(self, "_c_tok", 0)
+                STATE["prompt"] += getattr(self, "_p_tok", 0)
+
+    def _mock_post(self, body):
         try:
             j = json.loads(body.decode("utf-8", "replace"))
         except Exception:
@@ -48,8 +82,9 @@ class MockHandler(BaseHTTPRequestHandler):
         if not last:
             last = str(j.get("prompt", ""))
         reply = "echo: " + str(last)[:80]
-        p_tok = max(1, len(str(last)) // 4 + 4)
-        c_tok = max(1, len(reply) // 4 + 4)
+        self._p_tok = max(1, len(str(last)) // 4 + 4)
+        self._c_tok = max(1, len(reply) // 4 + 4)
+        p_tok, c_tok = self._p_tok, self._c_tok
         path = self.path.split("?")[0]
         if path.endswith("/chat/completions"):
             if j.get("stream"):

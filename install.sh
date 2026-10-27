@@ -4,6 +4,7 @@
 # 用法:
 #   ./install.sh v1              安装 v1（纯监控大屏）
 #   ./install.sh v2              安装 v2（监控 + API 分发网关）
+#   ./install.sh v3              安装 v3（监控 + 网关负载均衡 + 负载均衡总表）
 #   ./install.sh latest          安装最新开发版（master）
 #   ./install.sh v2.0.0          安装指定 tag（打 tag 发布后可用）
 #   ./install.sh list            列出仓库已发布的版本 tag
@@ -77,6 +78,10 @@ resolve() {
     v2)
       REF="v2.0.0"; FB_REF="master"; FB_FILE="vllm_dashboard.py"
       DESC="v2（监控 + API 分发网关）"
+      ;;
+    v3)
+      REF="v3.0.0"; FB_REF="master"; FB_FILE="vllm_dashboard.py"
+      DESC="v3（监控 + 网关负载均衡）"
       ;;
     latest)
       REF="master"; FB_REF=""; FB_FILE=""

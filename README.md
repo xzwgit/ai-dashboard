@@ -37,9 +37,12 @@
 | **模型/接入** | 模型卡 | 模型 ID（自动抓 /v1/models）、vLLM 版本（自动抓 /version）、上下文长度、权重路径、接入地址（127.0.0.1 自动替换为实际访问 IP）、API Key——客户端接入信息一眼可抄 |
 | **工具** | ⚙ 设置菜单 | 添加监控目标 / 导出日志 |
 | | 导出日志 | 当前目标全部序列一键 CSV（带 BOM，Excel 直开；含目标信息与口径注释头） |
-| **API 分发网关（v2）** | OpenAI 兼容反代 | `--gw` 启用，`/gw/v1/*` 端点；多渠道优先级+权重路由、连接类失败自动转移、SSE 流式逐 chunk 透传（自动注入 include_usage 拿准确用量） |
+| **API 分发网关（v2+）** | OpenAI 兼容反代 | `--gw` 启用，`/gw/v1/*` 端点；多渠道优先级+权重路由、连接类失败自动转移、SSE 流式逐 chunk 透传（自动注入 include_usage 拿准确用量） |
 | | Key 管理（UI） | ⚙ → API 分发：一键生成 sk- Key / 命名 / RPM+token 配额 / 启停 / 删除；「复制接入」出 curl+Python SDK 现成接入片段 |
 | | 限流与记账 | Key 级 401/403/429；token 记账与引擎 usage 精确对账；渠道级 3 连败熔断 60s；网关统计（请求/成功/失败/token/均延迟） |
+| **负载均衡（v3）** | 策略分流 | 四种策略同优先级层内分流：加权随机 / 轮询 / P2C 二选一（比在途请求数）/ 最少负载（按引擎运行请求数，监控指标感知）；跨优先级层自动故障转移 |
+| | 主动探活 | 渠道每 10s GET /health；探活失败的渠道自动摘除（不再被路由命中），全挂时不雪崩 |
+| | 负载均衡总表 | 渠道 × 引擎实时一张表：状态 / 探活延迟 / 在途 / 请求失败 / QPS(1m) / token / 均延迟 + 引擎侧运行/排队/KV/Decode tok/s（渠道地址与监控目标一致时自动联动）+ 合计行 |
 | **部署特性** | 单文件零依赖 | 纯 Python 标准库，本地/服务器一条命令起；`--demo` 内置仿真数据源可无服务预览；页面隐藏自动暂停轮询 |
 
 ## 安装（同一仓库选版本，v1/v2 并存）
@@ -47,7 +50,9 @@
 在目标机器（Linux，需 curl 或 wget）上选版本安装：
 
 ```bash
-# 一键式：装 v2（监控 + API 分发网关）
+# 一键式：装 v3（监控 + 网关负载均衡 + 负载均衡总表）
+curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v3
+# 装 v2（监控 + API 分发网关）
 curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v2
 # 装 v1（纯监控大屏）
 curl -fsSL https://raw.githubusercontent.com/xzwgit/vllm-dashboard/master/install.sh | bash -s v1
@@ -97,7 +102,8 @@ python vllm_dashboard.py --demo
 - `vllm_dashboard.py` — 工具本体（后端抓取/聚合 + 内嵌前端，~1600 行）
 - `vllm_dashboard_v1.py` — v1.0.0 冻结副本（install.sh 的 v1 回退来源）
 - `install.sh` — 版本安装脚本（v1/v2/latest/指定 tag/list；tag 优先、回退 master 冻结副本、VD_PROXY 镜像前缀）
-- `test_mock_openai.py` — mock OpenAI 上游（非流式+流式+models），手边没有 vLLM 时联调网关用
+- `test_mock_openai.py` — mock OpenAI 上游（非流式+流式+models+/health+/metrics），手边没有 vLLM 时联调网关用
+- `test_lb_v3.py` — 负载均衡本地测试套件（双 mock：策略分流/故障转移/探活/总表，17 项断言）
 
 ## 实测背景
 
@@ -114,6 +120,7 @@ python vllm_dashboard.py --demo
 |---|---|---|
 | v1.0.0 | 2026-10-26 | 定版：监控大屏基础功能（多目标抓取/11 张 vLLM 指标卡/5 图/服务器信息/模型接入卡/CSV 导出/失败诊断）。冻结副本 `vllm_dashboard_v1.py` |
 | v2.0.0 | 2026-10-26 | **内置轻量网关交付**（M1+M2+M3 一次完成）：--gw 启用；/gw/v1/* OpenAI 兼容反代+渠道路由故障转移+SSE 透传；Key 生成/配额/RPM/记账（UI）；熔断；⚙ 面板。mock 全链路 10/10 + 真机 vLLM（流式/记账对账 token 精确一致）+ v1 监控回归全过 |
+| v3.0.0 | 2026-10-27 | **网关负载均衡 + 负载均衡总表**：四种策略（加权随机/轮询/P2C/最少负载-引擎指标感知，vllm-router 同款策略族）；主动探活（10s /health，失败自动摘除）；在途请求计数；QPS 窗口；总表=渠道×引擎实时一张表（探活/在途/QPS/token/引擎运行/KV/Decode+合计行）。本地双 mock 17/17 + 双机真机验证（轮询精确分流、探活 10s 摘除、故障转移 6/6） |
 
 ## 已知事项
 
