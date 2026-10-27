@@ -701,21 +701,44 @@ class NodeCollector:
 
     @staticmethod
     def _sample_power():
-        best = None
-        for args in (["dcmi", "power reading"], ["sdr", "type", "Power"]):
+        """整机功率读取链：dcmi 直读 → sensor list 按 PSU PIN 求和（整机输入功率）→ POUT 求和 → 单功率传感器。"""
+        # 1) dcmi 直读（最准，部分 BMC 支持）
+        try:
+            r = subprocess.run(["ipmitool", "dcmi", "power reading"], capture_output=True, timeout=8)
+            m = re.search(r"Instantaneous power reading:\s*([0-9]+(?:\.[0-9]+)?)", r.stdout.decode("utf-8", "replace"))
+            if m and float(m.group(1)) > 0:
+                return float(m.group(1))
+        except Exception:
+            pass
+        # 2) sensor list / sdr elist 瓦特行聚合
+        for args in (["sensor", "list"], ["sdr", "elist"]):
+            pins, pouts, others = [], [], []
             try:
                 r = subprocess.run(["ipmitool"] + args, capture_output=True, timeout=8)
                 for ln in r.stdout.decode("utf-8", "replace").splitlines():
-                    m2 = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*Watts?", ln)
-                    if m2:
-                        w = float(m2.group(1))
-                        if w > 0:
-                            return w
-                        if best is None:
-                            best = w
+                    parts = [x.strip() for x in ln.split("|")]
+                    if len(parts) < 3 or not parts[2].lower().startswith("watt"):
+                        continue
+                    try:
+                        v = float(parts[1])
+                    except ValueError:
+                        continue
+                    nm = parts[0].upper()
+                    if "PIN" in nm:
+                        pins.append(v)
+                    elif "POUT" in nm:
+                        pouts.append(v)
+                    else:
+                        others.append(v)
+                if pins:
+                    return sum(pins)      # 各 PSU 输入功率之和 = 整机输入功率
+                if pouts:
+                    return sum(pouts)
+                if others:
+                    return max(others)   # 单一整机功率传感器
             except Exception:
                 continue
-        return best
+        return None
 
     def _loop(self):
         while not self._stop.wait(self.interval):
