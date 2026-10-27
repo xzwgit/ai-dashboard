@@ -44,12 +44,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "3.2.0"    # v3.2：主屏右侧服务器列表（引擎简况卡，点击切换）；v3.1.1：主屏更名；v3.1：固定主屏（全场合计）
+VERSION = "3.3.0"    # v3.3：主屏两栏（右列服务器列表通栏+宿主机简况：CPU/GPU/内存/系统/运行时间，引擎机跑同款实例自动接入）；v3.2：右侧列表；v3.1.1：主屏更名；v3.1：固定主屏
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
 DEFAULT_INTERVAL = 2.0
 DEFAULT_HISTORY = 5400  # 每目标最多保留点数（2s 间隔 ≈ 3 小时）
+NODE_INFO_PORT = 8124   # 引擎机宿主机简况端口：目标机上跑同款大屏（默认端口）即自动接入 CPU/GPU/内存信息
 
 # 计数器/仪表别名（新名在前，旧名在后，命中哪个用哪个）
 ALIAS = {
@@ -181,6 +182,22 @@ def hist_delta(b_now, b_ref):
 
 # ============================== 目标与抓取 ==============================
 
+def wire_local_node(t):
+    """本机目标（127.0.0.1/localhost）直连本进程 NodeCollector，省一次 HTTP。"""
+    try:
+        from urllib.parse import urlparse
+        h = (urlparse(t.url).hostname or "").lower()
+        if h in ("127.0.0.1", "localhost", "::1"):
+
+            def _prov():
+                if Handler.node and Handler.node.available:
+                    return Handler.node.snapshot()
+                return None
+            t._node_provider = _prov
+    except Exception:
+        pass
+
+
 class Target:
     _seq = 0
 
@@ -212,6 +229,12 @@ class Target:
         self.kv_max_tokens = 0
         self.lock = threading.Lock()
         self._stop = threading.Event()
+        self.node = None          # 宿主机简况（同款大屏实例的 /api/node；无则 None）
+        self._node_provider = None  # 本机目标直连进程内 NodeCollector（不走 HTTP）
+        from urllib.parse import urlparse as _up
+        _pu = _up(self.url)
+        _host = _pu.hostname or "127.0.0.1"
+        self.node_url = "%s://%s:%d/api/node" % (_pu.scheme or "http", _host, NODE_INFO_PORT)
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
     # ---------- 抓取 ----------
@@ -243,6 +266,25 @@ class Target:
                 self.last_error = self._friendly_error(e)
             if self.n_scrapes % 30 == 1:      # 模型元数据 ~60s 刷新一次
                 threading.Thread(target=self._fetch_meta, daemon=True).start()
+            if self.n_scrapes % 5 == 1:       # 宿主机简况 ~10s 刷新一次（引擎机上跑同款大屏即有）
+                threading.Thread(target=self._fetch_node, daemon=True).start()
+
+    def _fetch_node(self):
+        if self._node_provider is not None:
+            try:
+                self.node = self._node_provider()
+            except Exception:
+                self.node = None
+            return
+        try:
+            with urllib.request.urlopen(self.node_url, timeout=3) as r:
+                j = json.loads(r.read().decode("utf-8", "replace"))
+            if j.get("available"):
+                self.node = j
+            else:
+                self.node = None
+        except Exception:
+            self.node = None
 
     @staticmethod
     def _friendly_error(e):
@@ -1477,6 +1519,7 @@ class Handler(BaseHTTPRequestHandler):
                           "tpot_p95", "ttft_p95", "gen_tokens_total",
                           "prompt_tokens_total", "preemptions", "finished"):
                     row[k] = nb.get(k)
+                row["node"] = getattr(t, "node", None)
                 rows.append(row)
             tot["tpot_p95"] = (sum(tpots) / len(tpots)) if tpots else None
             gw = None
@@ -1538,6 +1581,7 @@ class Handler(BaseHTTPRequestHandler):
             t = Handler.reg.add(name, url, payload.get("api_key") or "",
                                 model_path=(payload.get("model_path") or "").strip(),
                                 context_len=(payload.get("context_len") or "").strip())
+            wire_local_node(t)
             self._json({"ok": True, "id": t.id})
         elif path.startswith("/api/gateway/") and Handler.gw:
             g = Handler.gw
@@ -1620,9 +1664,12 @@ def main():
         else:
             name, url = spec.rsplit("/", 1)[-1] or "target", spec
         if not any(t.url.rstrip("/") == url.rstrip("/") for t in reg.targets):
-            reg.add(name, url, args.api_key)
+            t = reg.add(name, url, args.api_key)
+            wire_local_node(t)
             print("[target] %s = %s" % (name, url))
     reg.save()
+    for t in reg.targets:      # 持久化恢复的目标也接线
+        wire_local_node(t)
 
     if args.gw:
         gw = Gateway(args.gw_config)
@@ -1749,8 +1796,10 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
   gap:10px;align-content:start;justify-content:start}
 .nodes{display:grid;grid-template-columns:minmax(240px,1fr);gap:12px;
   flex:1 1 340px;min-width:300px;align-content:start}
-.ovright{flex:1 1 300px;min-width:280px;max-height:360px;display:flex}
-.ovright .card{flex:1;max-height:360px;overflow-y:auto}
+.ovlay{display:flex;gap:12px;align-items:flex-start}
+.ovL{flex:1;min-width:0}
+.ovR{width:335px;flex:none;position:sticky;top:8px}
+.ovR .card{max-height:calc(100vh - 76px);overflow-y:auto}
 .ovnode{padding:8px 10px;border:1px solid var(--panel-border);border-radius:10px;margin-bottom:8px;
   background:rgba(15,23,42,.35);cursor:pointer}
 .ovnode:hover{border-color:rgba(34,211,238,.4)}
@@ -1868,13 +1917,12 @@ canvas.chart{width:100%;height:100%;display:block}
   <div id="banner"></div>
 
   <div id="mainOv" style="display:none">
+    <div class="ovlay">
+    <div class="ovL">
     <div class="zone">
       <div class="zleft">
         <div class="card modelcard"><h4>全场总览</h4><table id="tb-ovsum"></table></div>
         <div class="kpis" id="ovKpis"></div>
-      </div>
-      <div class="ovright">
-        <div class="card"><h4>服务器列表（引擎简况，点击切换）</h4><div id="ovNodes"></div></div>
       </div>
     </div>
     <div class="charts">
@@ -1890,6 +1938,11 @@ canvas.chart{width:100%;height:100%;display:block}
         </tr></thead><tbody></tbody></table>
       </div>
       <div class="card"><h4>全场累计</h4><table id="tb-ovtotal"></table></div>
+    </div>
+    </div>
+    <div class="ovR">
+      <div class="card"><h4>服务器列表（引擎 · 简况）</h4><div id="ovNodes"></div></div>
+    </div>
     </div>
   </div>
 
@@ -2318,11 +2371,19 @@ function renderOverview(ov){
     const host=((r.url||"").replace(/^https?:\/\//,"")
       .replace(/^(127\.0\.0\.1|localhost)(:|\/|$)/,location.hostname+"$2"));
     const kv=r.kv_perc==null?"—":fmtPct(r.kv_perc);
+    const n=r.node, nw=(n&&n.now)||{};
+    const mem=nw.mem_total?`${nw.mem_used.toFixed(0)} / ${nw.mem_total.toFixed(0)} GB（${nw.mem_perc!=null?Math.round(nw.mem_perc):"—"}%）`:"—";
     return `<div class="ovnode" data-id="${r.id}">
       <div class="ovhead"><span class="led ${r.status}"></span><b>${esc(r.name)}</b>
         <span class="dim mono">${esc(host)}</span></div>
       <div class="ln">运行 ${fmtInt(r.running)} / 排队 ${fmtInt(r.waiting)} 路 · Decode ${fmtRate(r.gen_rate)} tok/s · Prefill ${fmtRate(r.prompt_rate)}</div>
       <div class="ln">KV ${kv} · TPOT p95 ${r.tpot_p95==null?"—":fmtMs(r.tpot_p95)} · 累计生成 ${fmtTok(r.gen_tokens_total)} tok</div>
+      ${n?`
+      <div class="ln">CPU ${nw.cpu!=null?Math.round(nw.cpu):"—"}% · ${esc(n.cpu_name||"")} ${n.cpu_cores||"?"} 核</div>
+      <div class="ln">GPU ${nw.gpu_util!=null?Math.round(nw.gpu_util):"—"}% · ${esc(n.gpu_name||"")}${n.per_gpu&&n.per_gpu.length?" × "+n.per_gpu.length:""}</div>
+      <div class="ln">内存 ${mem} · ${esc(n.os_pretty||"")}</div>
+      <div class="ln dim">已运行 ${fmtUp(n.uptime_s)}${n.ip?" · IP "+esc(n.ip):""}</div>`
+      :`<div class="ln dim">宿主机信息未接入（在该机 :8124 跑一个同款大屏实例即自动接入 CPU/GPU/内存）</div>`}
       <div class="ln dim">${esc(r.model||"—")}${r.version?" · vLLM "+esc(r.version):""}</div>
     </div>`;}).join("")||`<div class="dim" style="padding:10px">暂无监控目标（⚙ → ＋ 添加监控目标）</div>`;
   $("ovNodes").onclick=e=>{
@@ -2404,6 +2465,8 @@ function render(){
    <tr><td>KV 抢占次数</td><td>${fmtInt(d.now.preemptions)}</td></tr>
    <tr><td>监控已运行</td><td>${uptimeStr(d.monitor_since)}</td></tr>`;
 }
+function fmtUp(s){if(s==null)return"—";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+  return (d?d+" 天 ":"")+(d||h?h+" 小时 ":"")+m+" 分";}
 function uptimeStr(ts){const s=Math.max(0,Date.now()/1000-ts);const m=Math.floor(s/60);
   return m>=60?Math.floor(m/60)+" 小时 "+(m%60)+" 分":m+" 分 "+Math.floor(s%60)+" 秒";}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -2659,8 +2722,6 @@ function renderNode(){
   }else{ndMem.querySelector(".val").textContent="—";ndMem.querySelector(".sub").textContent="";}
   setBar(ndMem,now.mem_perc||0,80,92);
   const nG=(n.per_gpu||[]).length;
-  function fmtUp(s){if(s==null)return"—";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
-    return (d?d+" 天 ":"")+(d||h?h+" 小时 ":"")+m+" 分";}
   function ibar(p,warn,crit){const w=Math.max(0,Math.min(100,p||0));
     const col=(p||0)>=crit?"#fb7185":(p||0)>=warn?"#fbbf24":"#34d399";
     return `<span style="display:inline-block;width:66px;height:6px;border-radius:3px;background:rgba(130,160,255,.12);vertical-align:middle;margin-left:9px"><span style="display:inline-block;width:${w}%;height:100%;border-radius:3px;background:${col}"></span></span>`;}
