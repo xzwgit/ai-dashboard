@@ -1874,6 +1874,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 #lg-ovcum{display:none}   # 机器多时图例占空间，隐藏（悬停仍显示每线名称）
 #mainOv .charts{grid-template-columns:repeat(2,minmax(0,1fr))}
 #mainSingle .charts{grid-template-columns:repeat(3,minmax(0,1fr))}
+#mainSingle .kpis{grid-template-columns:repeat(auto-fit,minmax(148px,1fr));justify-content:stretch}
 #ovKpis{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));justify-content:stretch}
 .ovL{flex:1;min-width:0;margin-right:350px}
 .ovR{position:absolute;top:0;right:0;bottom:0;width:338px;display:flex}
