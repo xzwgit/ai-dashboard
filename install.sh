@@ -80,7 +80,7 @@ resolve() {
       DESC="v2（监控 + API 分发网关）"
       ;;
     v3)
-      REF="v3.1.0"; FB_REF="master"; FB_FILE="vllm_dashboard.py"
+      REF="v3.1.1"; FB_REF="master"; FB_FILE="vllm_dashboard.py"
       DESC="v3（监控 + 网关负载均衡 + 负载均衡总表）"
       ;;
     latest)

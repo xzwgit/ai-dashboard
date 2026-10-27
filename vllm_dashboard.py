@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================== 配置 ==============================
 
-VERSION = "3.1.0"    # v3.1：固定总览页签（全场合计大屏：机器数/总吞吐/总并发/各机明细+对比曲线）
+VERSION = "3.1.1"    # v3.1.1：固定主屏页签更名（原"总览"）；v3.1：全场合计大屏（机器数/总吞吐/总并发/各机明细+对比曲线）
 
 W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
@@ -1980,7 +1980,7 @@ canvas.chart{width:100%;height:100%;display:block}
 <script>
 "use strict";
 /* ---------------- 全局状态 ---------------- */
-const OV="__ov__";   // 固定总览页签（不可移除，始终第一位）
+const OV="__ov__";   // 固定主屏页签（不可移除，始终第一位）
 let targets=[], activeId=OV, rangeMin=15, data=null, timer=null, ovData=null, ovSeries=null;
 
 const $=id=>document.getElementById(id);
@@ -2210,8 +2210,8 @@ function renderTabs(){
   const ov=document.createElement("div");
   const allUp=targets.length>0&&targets.every(t=>t.status==="up");
   ov.className="tab"+(activeId===OV?" active":"");
-  ov.innerHTML=`<span class="led ${targets.length?(allUp?"up":"down"):""}"></span><span class="nm">总览</span>`;
-  ov.title="全场总览（固定）";
+  ov.innerHTML=`<span class="led ${targets.length?(allUp?"up":"down"):""}"></span><span class="nm">主屏</span>`;
+  ov.title="主屏（全场合计，固定）";
   ov.onclick=()=>{activeId=OV;renderTabs();pollData();};
   box.appendChild(ov);
   for(const t of targets){
