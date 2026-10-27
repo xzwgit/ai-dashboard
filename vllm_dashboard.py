@@ -1796,11 +1796,13 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
   gap:10px;align-content:start;justify-content:start}
 .nodes{display:grid;grid-template-columns:minmax(240px,1fr);gap:12px;
   flex:1 1 340px;min-width:300px;align-content:start}
-.ovlay{display:flex;gap:12px;align-items:flex-start}
+.ovlay{display:flex;gap:12px;align-items:stretch}
 #ovKpis{grid-template-columns:repeat(7,minmax(118px,150px))}
 .ovL{flex:1;min-width:0}
-.ovR{width:335px;flex:none;position:sticky;top:8px}
-.ovR .card{max-height:calc(100vh - 76px);overflow-y:auto}
+.ovR{width:335px;flex:none;display:flex}
+.ovR .card{flex:1;display:flex;flex-direction:column;min-height:0}
+.ovR .card h4{flex:none}
+#ovNodes{flex:1;overflow-y:auto;min-height:0;padding-right:2px}
 .ovnode{padding:8px 10px;border:1px solid var(--panel-border);border-radius:10px;margin-bottom:8px;
   background:rgba(15,23,42,.35);cursor:pointer}
 .ovnode:hover{border-color:rgba(34,211,238,.4)}
@@ -1932,17 +1934,17 @@ canvas.chart{width:100%;height:100%;display:block}
       <div class="panel"><h3>并发请求（合计）<span class="legend" id="lg-ovcc"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovcc"></canvas></div></div>
       <div class="panel"><h3>累计 Decode（各机对比）<span class="legend" id="lg-ovcum"></span></h3><div class="cwrap"><canvas class="chart" id="ch-ovcum"></canvas></div></div>
     </div>
+    </div>
+    <div class="ovR">
+      <div class="card"><h4>服务器列表（引擎 · 简况）</h4><div id="ovNodes"></div></div>
+    </div>
+    </div>
     <div class="info">
       <div class="card"><h4>机器明细（点击名称切换到该机大屏）</h4>
         <table class="ovtbl" id="tb-ovmach"><thead><tr>
           <th></th><th>名称</th><th>Decode</th><th>Prefill</th><th>运行/排队</th><th>KV</th><th>TPOT p95</th><th>累计生成</th><th>模型 / 版本</th>
         </tr></thead><tbody></tbody></table>
       </div>
-    </div>
-    </div>
-    <div class="ovR">
-      <div class="card"><h4>服务器列表（引擎 · 简况）</h4><div id="ovNodes"></div></div>
-    </div>
     </div>
   </div>
 
