@@ -2382,15 +2382,12 @@ function renderOverview(ov){
     return `<div class="ovnode" data-id="${r.id}">
       <div class="ovhead"><span class="led ${r.status}"></span><b>${esc(r.name)}</b>
         <span class="dim mono">${esc(host)}</span></div>
-      <div class="ln">运行 ${fmtInt(r.running)} / 排队 ${fmtInt(r.waiting)} 路 · Decode ${fmtRate(r.gen_rate)} tok/s · Prefill ${fmtRate(r.prompt_rate)}</div>
-      <div class="ln">KV ${kv} · TPOT p95 ${r.tpot_p95==null?"—":fmtMs(r.tpot_p95)} · 累计生成 ${fmtTok(r.gen_tokens_total)} tok</div>
       ${n?`
       <div class="ln">CPU ${nw.cpu!=null?Math.round(nw.cpu):"—"}% · ${esc(n.cpu_name||"")} ${n.cpu_cores||"?"} 核</div>
       <div class="ln">GPU ${nw.gpu_util!=null?Math.round(nw.gpu_util):"—"}% · ${esc(n.gpu_name||"")}${n.per_gpu&&n.per_gpu.length?" × "+n.per_gpu.length:""}</div>
       <div class="ln">内存 ${mem} · ${esc(n.os_pretty||"")}</div>
       <div class="ln dim">已运行 ${fmtUp(n.uptime_s)}${n.ip?" · IP "+esc(n.ip):""}</div>`
       :`<div class="ln dim">宿主机信息未接入（在该机 :8124 跑一个同款大屏实例即自动接入 CPU/GPU/内存）</div>`}
-      <div class="ln dim">${esc(r.model||"—")}${r.context_len?" · "+fmtCtx(r.context_len)+" ctx":""}${r.version?" · vLLM "+esc(r.version):""}</div>
     </div>`;}).join("")||`<div class="dim" style="padding:10px">暂无监控目标（⚙ → ＋ 添加监控目标）</div>`;
   $("ovNodes").onclick=e=>{
     const nd=e.target.closest(".ovnode");if(!nd)return;
