@@ -1816,7 +1816,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;
 .ovnode .ovhead{display:flex;align-items:center;gap:7px;font-size:13.5px;margin-bottom:4px}
 .ovnode .ovhead b{color:#cfe3ff}
 .ovnode .dim{color:var(--dim);font-size:11.5px}
-.ovnode .ln{font-size:12.5px;color:#aebfe6;margin:2px 0}
+.ovnode .ln{font-size:12.5px;color:#aebfe6;margin:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 @media (max-width:1280px){.kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));flex:1 1 100%}}
 .kpi{background:var(--panel);border:1px solid var(--panel-border);border-radius:13px;
   padding:9px 12px 7px;backdrop-filter:blur(8px);position:relative;overflow:hidden;transition:border-color .3s}
@@ -2385,14 +2385,17 @@ function renderOverview(ov){
     const kv=r.kv_perc==null?"—":fmtPct(r.kv_perc);
     const n=r.node, nw=(n&&n.now)||{};
     const mem=nw.mem_total?`${nw.mem_used.toFixed(0)} / ${nw.mem_total.toFixed(0)} GB（${nw.mem_perc!=null?Math.round(nw.mem_perc):"—"}%）`:"—";
+    const cn=(n.cpu_name||"").replace(/^(AMD|Intel\(R\)|Intel)\s+/,"").replace(/\s*\S*[Cc]ore\s*[Pp]rocessor$/,"").replace(/\s+Processor$/,"");
+    const gn=(n.gpu_name||"").replace(/^NVIDIA\s+/,"");
+    const osn=(n.os_pretty||"").replace(/\s+LTS$/,"");
     return `<div class="ovnode" data-id="${r.id}">
       <div class="ovhead"><span class="led ${r.status}"></span><b>${esc(r.name)}</b>
         <span class="dim mono">${esc(host)}</span></div>
       ${n?`
-      <div class="ln">CPU ${nw.cpu!=null?Math.round(nw.cpu):"—"}% · ${esc(n.cpu_name||"")} ${n.cpu_cores||"?"} 核</div>
-      <div class="ln">GPU ${nw.gpu_util!=null?Math.round(nw.gpu_util):"—"}% · ${esc(n.gpu_name||"")}${n.per_gpu&&n.per_gpu.length?" × "+n.per_gpu.length:""}</div>
-      <div class="ln">内存 ${mem} · ${esc(n.os_pretty||"")}</div>
-      <div class="ln dim">已运行 ${fmtUp(n.uptime_s)}${n.ip?" · IP "+esc(n.ip):""}</div>`
+      <div class="ln">CPU ${nw.cpu!=null?Math.round(nw.cpu):"—"}% · ${esc(cn||"?")} · ${n.cpu_cores||"?"} 核</div>
+      <div class="ln">GPU ${nw.gpu_util!=null?Math.round(nw.gpu_util):"—"}% · ${esc(gn||"—")}${n.per_gpu&&n.per_gpu.length?" × "+n.per_gpu.length:""}</div>
+      <div class="ln">内存 ${mem}</div>
+      <div class="ln dim">${esc(osn||"—")} · 运行 ${fmtUp(n.uptime_s)}</div>`
       :`<div class="ln dim">宿主机信息未接入（在该机 :8124 跑一个同款大屏实例即自动接入 CPU/GPU/内存）</div>`}
     </div>`;}).join("")||`<div class="dim" style="padding:10px">暂无监控目标（⚙ → ＋ 添加监控目标）</div>`;
   $("ovNodes").onclick=e=>{
