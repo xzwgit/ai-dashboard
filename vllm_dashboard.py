@@ -30,6 +30,7 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -48,7 +49,8 @@ W_RATE = 12.0        # 吞吐差分窗口（秒）
 W_PCT = 30.0         # 延迟分位窗口（秒）
 DEFAULT_INTERVAL = 2.0
 DEFAULT_HISTORY = 5400  # 每目标最多保留点数（2s 间隔 ≈ 3 小时）
-NODE_INFO_PORT = 8124   # 引擎机宿主机简况端口：目标机上跑同款大屏（默认端口）即自动接入 CPU/GPU/内存信息
+NODE_INFO_PORT = 8124
+PERSIST = None   # 引擎机宿主机简况端口：目标机上跑同款大屏（默认端口）即自动接入 CPU/GPU/内存信息
 
 # 计数器/仪表别名（新名在前，旧名在后，命中哪个用哪个）
 ALIAS = {
@@ -450,6 +452,11 @@ class Target:
         for k, v in s.items():
             self.series[k].append(v)
         self.last_ts = t[i]
+        if PERSIST is not None:
+            try:
+                PERSIST.push(self.url, t[i], s)
+            except Exception:
+                pass
 
     def now_brief(self):
         """最新指标简表（网关按引擎负载路由 / 负载均衡总表 / 全场总览用；无数据返回 None）。"""
@@ -782,6 +789,17 @@ class Registry:
 
     def _add(self, name, url, api_key="", start=True, transient=False, model_path="", context_len=""):
         t = Target(name, url, api_key, model_path=model_path, context_len=context_len)
+        if PERSIST is not None:
+            rows = PERSIST.load_recent(t.url)
+            if rows:
+                t._t = [r[0] for r in rows]
+                t._raw = [dict() for _ in rows]
+                t._hist = [dict() for _ in rows]
+                for ci, col in enumerate(PersistStore.COLS):
+                    if col in t.series:
+                        t.series[col] = [r[ci + 1] for r in rows]
+                t.last_ts = t._t[-1]
+                t.n_scrapes = len(rows)
         t.transient = transient
         if start:
             t.thread.start()
@@ -974,6 +992,73 @@ class DemoEngine:
 # ============================== 内置轻量网关（API 分发） ==============================
 
 GW_CONNECT_TIMEOUT = 15.0
+
+class PersistStore:
+    """SQLite 持久化：每 5 秒批量写入派生序列点；启动回灌。"""
+
+    COLS = ["gen_rate", "prompt_rate", "running", "waiting", "kv_perc",
+            "ttft_p50", "ttft_p95", "tpot_p50", "tpot_p95", "e2e_p95", "queue_p95",
+            "spec_accept", "prefix_hit", "gen_tokens_total", "prompt_tokens_total"]
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self._buf = []
+        self._last_ts = {}
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        cols_sql = ", ".join("%s REAL" % c for c in self.COLS)
+        self.db.execute("CREATE TABLE IF NOT EXISTS samples (target_id TEXT NOT NULL, ts REAL NOT NULL, %s)" % cols_sql)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_samples ON samples(target_id, ts)")
+        self.db.commit()
+        threading.Thread(target=self._flush_loop, daemon=True).start()
+
+    def push(self, target_id, ts, point):
+        with self.lock:
+            if self._last_ts.get(target_id) == ts:
+                return
+            self._last_ts[target_id] = ts
+            self._buf.append((target_id, ts, point))
+            if len(self._buf) > 500:
+                self._flush()
+
+    def _flush_loop(self):
+        while True:
+            time.sleep(5)
+            with self.lock:
+                if self._buf:
+                    self._flush()
+
+    def _flush(self):
+        rows = self._buf[:]
+        self._buf.clear()
+        try:
+            ph = ", ".join(["?"] * (2 + len(self.COLS)))
+            for tid, ts, pt in rows:
+                vals = [pt.get(c) for c in self.COLS]
+                self.db.execute(
+                    "INSERT OR REPLACE INTO samples (target_id, ts, %s) VALUES (%s)" % (", ".join(self.COLS), ph),
+                    [tid, ts] + vals)
+            self.db.commit()
+        except Exception:
+            pass
+
+    def load_recent(self, target_id, limit=5400):
+        try:
+            cur = self.db.execute(
+                "SELECT ts, %s FROM samples WHERE target_id=? ORDER BY ts DESC LIMIT %d" % (", ".join(self.COLS), limit),
+                (target_id,))
+            rows = cur.fetchall()
+            rows.reverse()
+            return rows
+        except Exception:
+            return []
+
+    def close(self):
+        with self.lock:
+            self._flush()
+            self.db.close()
+
+
 GW_STREAM_IDLE_TIMEOUT = 300.0    # 流式两 chunk 间空闲上限（长思考不误杀）
 GW_REQ_TIMEOUT = 600.0
 GW_BREAK_NFAIL = 3                # 连接类连续失败 N 次 → 熔断
@@ -1705,7 +1790,7 @@ class Handler(BaseHTTPRequestHandler):
             body = AGENT_MD.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/markdown; charset=utf-8")
-            self.send_header("Content-Disposition", 'attachment; filename="agent.md"')
+            self.send_header("Content-Disposition", 'attachment; filename="agent指引.md"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1887,6 +1972,7 @@ def main():
     ap.add_argument("--gw-port", type=int, default=8125, help="网关监听端口（默认 8125）")
     ap.add_argument("--gw-config", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "gateway.json"), help="网关配置文件（渠道+Key+用量）")
+    ap.add_argument("--persist", default="", help="SQLite持久化路径(启用后重启不丢)")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
     try:
@@ -1895,6 +1981,10 @@ def main():
         pass
 
     HTML = _build_html().replace("__APPVER__", VERSION)
+    global PERSIST
+    if args.persist:
+        PERSIST = PersistStore(args.persist)
+        print("[persist] SQLite 已启用:", args.persist)
     reg = Registry(args.config)
     Handler.reg = reg
     Handler.node = NodeCollector(interval=max(3.0, args.interval + 1.0))
@@ -2197,7 +2287,7 @@ canvas.chart{width:100%;height:100%;display:block}
         <div class="mi" id="miCfgExport">⬇ 导出配置（当前）</div>
         <div class="mi" id="miCfgExample">⬇ 导出示例配置</div>
         <div class="mi" id="miCfgImport">⬆ 导入配置</div>
-        <div class="mi" id="miAgentMd">⬇ 下载 agent.md</div>
+        <div class="mi" id="miAgentMd">⬇ 下载 agent指引.md</div>
         <input type="file" id="cfgFile" accept=".json,application/json" style="display:none">
         <div class="mver" title="当前运行的版本">v__APPVER__</div>
       </div>
