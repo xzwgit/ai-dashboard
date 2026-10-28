@@ -1,0 +1,14 @@
+[package]
+name = "ai-dashboard"
+version = "2.2.0"
+edition = "2021"
+description = "AI 推理性能监控大屏（Rust 版）：监控 + API 网关 + 负载均衡"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
