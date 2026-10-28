@@ -7,8 +7,12 @@ description = "AI 推理性能监控大屏（Rust 版）：监控 + API 网关 +
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+futures = "0.3"
+rand = "0.8"
+bytes = "1"
 
 [profile.release]
 opt-level = 2
