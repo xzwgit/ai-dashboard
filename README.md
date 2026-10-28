@@ -1,7 +1,7 @@
 # ai-dashboard — AI 推理性能监控大屏
 
 
-## 界面结构（2026-10-24 终版）
+## 界面结构
 
 - 标题独占居中行（两侧留空）；工具栏在下一行 = 目标页签 | 时间范围 | **⚙ 设置**（收起状态；菜单内含"＋ 添加监控目标"与"⬇ 导出日志（CSV）"）；右上无时钟（时间以服务器卡为准）
 - **左上：模型 / 接入信息卡**（版本 JSON 自动解析；接入地址自动把 127.0.0.1 换成页面实际访问主机），下方 vLLM KPI 卡两行左对齐（紧凑小卡）：Decode 吞吐 / Prefill 吞吐（独立两卡，带英文与累计值）/ KV Cache 剩余（进度条+90% 告警）/ 运行中请求 / TTFT p95 / TPOT p95 / 端到端 p95 / 前缀缓存命中 / 投机接受率 / KV 抢占 / 已完成请求
@@ -90,7 +90,7 @@ python vllm_dashboard.py --demo
 | 前缀缓存命中 | Δ`prefix_cache_hits_total` / Δ`prefix_cache_queries_total` |
 | 并发 / 抢占 / 完成数 | `num_requests_running` / `waiting`、`num_preemptions_total`、`request_success_total{finish_reason}` |
 
-新旧指标名都兼容（`generation_tokens_total`/`token_generation_tokens_total`、`kv_cache_usage_perc`/`gpu_cache_usage_perc`、`request_time_per_output_token_seconds`/`time_per_output_token_seconds`、`e2e_request_latency_seconds`/`request_latency_seconds`、`request_queue_time_seconds`/`time_in_queue_requests`），vLLM 0.32.0 实测对齐（2026-10-24，.154 上 1017+DSpark k4 实测清单）。
+新旧指标名都兼容（`generation_tokens_total`/`token_generation_tokens_total`、`kv_cache_usage_perc`/`gpu_cache_usage_perc`、`request_time_per_output_token_seconds`/`time_per_output_token_seconds`、`e2e_request_latency_seconds`/`request_latency_seconds`、`request_queue_time_seconds`/`time_in_queue_requests`），vLLM 0.32.0 实测对齐（含投机解码场景）。
 
 ## 文件
 
@@ -102,16 +102,6 @@ python vllm_dashboard.py --demo
 - `test_lb_v3.py` — 负载均衡本地测试套件（双 mock：策略分流/故障转移/探活/总表，17 项断言，2026-10-27 ALL PASS）
 - `boot_lb_158.sh` / `boot_lb_162.sh` / `lb_wait_*.sh` / `lb_burst_158.py` — 2026-10-27 双机负载均衡真机测试的操作脚本存档（.158/.162 各 boot 一个 1017 副本 → 大屏+网关 → burst → 故障转移）
 - `pull_env_weights_154.sh` / `boot_1017_154.sh` / `bench_154.sh` / `wait_ready_154.sh` / `mm_*_158.*` / `agent_loop_158.sh` / `boot_157_gwtest.sh` — 2026-10-24~26 各轮实测的操作脚本存档
-
-## 2026-10-24 .154 实测记录
-
-- 机器：10.10.3.154（server04，8×RTX PRO 6000 96G）
-- 环境：从 .158 rsync `vllm-fi02` venv（0.32.0+FI0.7.2+双补丁树，8.3G）+ FI/编译缓存；venv python 重链本机 uv cpython-3.12.13
-- 权重：.158:/data/models/DeepSeek-V4.1-Flash-1017 → .154:/data/models（476G，同网段 ~1GB/s）
-- boot：部署方案 v2.0 §4.1 形态（TP8/EP8、fp8 KV、FLASHINFER_MLA_SPARSE_DSV41、FULL 图、DSpark k4、util 0.90、capture 640、1M ctx、:8123/abc.12345）
-- 验证：探针 17*19→323 ✓、boot 日志 FULL_DECODE_ONLY ✓、/metrics 匿名可访问 ✓
-- bench：c32 1K×1K = **959 tok/s**（聚合，96G 参考带）；c32 2K×1K rate8 = 882 tok/s、TPOT 23.7ms、DSpark 接受率 23.6-27.8%（random 数据无前缀结构，偏低属预期）
-- 大屏：.154 侧 `python3 /root/dash_ops/vllm_dashboard.py --port 8124 --target '1017@154'=http://127.0.0.1:8123`（http://10.10.3.154:8124/）；本地侧同脚本指 http://10.10.3.154:8123 亦可（本地直连可达）
 
 ## 状态（2026-10-27）
 
