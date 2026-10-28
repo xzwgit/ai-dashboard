@@ -59,7 +59,7 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/ai-dashboard/m
 ```
 
 - **版本来源**：`v1`/`v2` 优先取 git tag（历史版本固定不变）；tag 不可达时回退 master（v1=冻结副本）；`latest`=master 开发版；支持 `./install.sh vX.Y.Z` 直装指定 tag。
-- **raw 被墙自动兜底**：raw.githubusercontent.com 不可达的网络（本机即如此）自动改走 api.github.com（base64 解码，无需配置）——2026-10-27 本机实测全走兜底装成。
+- **raw 被墙自动兜底**：raw.githubusercontent.com 不可达的网络（国内网络常见）自动改走 api.github.com（base64 解码，无需配置）。
 - 下载后校验 `VERSION` 常量；覆盖前备份 `.bak.<旧版本>.<时间戳>`；装完按版本打印启动命令。
 - **推送通道**：本机 github.com/raw 时通时断，**推送走跳板机 14.1.99.114（tar 上去用它家 classic token 推）**，raw 验证也在跳板机上 curl。
 
@@ -67,12 +67,12 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/xzwgit/ai-dashboard/m
 
 ```bash
 # 监控 + API 分发网关（本地转发 → 生成 Key → 局域网分发）
-python vllm_dashboard.py --gw --target 157-1017=http://10.10.3.157:8123
+python vllm_dashboard.py --gw --target my-vllm=http://10.0.0.1:8123
 #   网关端点 http://<本机IP>:8125/gw/v1（OpenAI 兼容）；页面 ⚙ → API 分发 里生成 Key 发同事
 # 监控一个 vLLM 服务（服务地址 = OpenAI 端口，/metrics 自动拼接）
-python vllm_dashboard.py --target 1017@154=http://10.10.3.154:8123
+python vllm_dashboard.py --target my-vllm=http://10.0.0.1:8123
 # 多目标（页签切换，页面里也可随时增删，存 targets.json）
-python vllm_dashboard.py --port 8124 --target a=http://10.10.3.154:8123 --target b=http://10.10.50.180:8123 --api-key abc.12345
+python vllm_dashboard.py --port 8124 --target a=http://10.0.0.1:8123 --target b=http://10.0.0.2:8123 --api-key sk-xxxx
 # 没有服务时看界面效果（内置仿真数据源，周期负载：空闲→爬坡→c32→排空）
 python vllm_dashboard.py --demo
 ```
@@ -96,18 +96,14 @@ python vllm_dashboard.py --demo
 
 - `vllm_dashboard.py` — 工具本体（后端抓取/聚合 + 内嵌前端，~1600 行）
 - `vllm_dashboard_v1.py` — v1.0.0 冻结副本（install.sh 的 v1 回退来源）
-- `install.sh` — 版本安装脚本（v1/v2/latest/指定 tag/list；tag 优先、回退 master 冻结副本、VD_PROXY 镜像前缀；2026-10-27 本地 mock 源全分支测试 + GitHub live list 通过）
-- `rrun.py` — paramiko 远程执行/上传小工具（154/158/162/180/55，凭据见《服务器台账.md》；`.154` 的 sftp 子系统对 paramiko 报 ENOENT，用 `--bput` base64 直写绕过；Git Bash 下带绝对路径参数须加 `MSYS_NO_PATHCONV=1`）
+- `install.sh` — 版本安装脚本（v1/v2/latest/指定 tag/list；tag 优先、回退 master 冻结副本、VD_PROXY 镜像前缀）
 - `test_mock_openai.py` — mock OpenAI 上游（非流式+流式+models+/health+/metrics），手边没有 vLLM 时联调网关用
-- `test_lb_v3.py` — 负载均衡本地测试套件（双 mock：策略分流/故障转移/探活/总表，17 项断言，2026-10-27 ALL PASS）
-- `boot_lb_158.sh` / `boot_lb_162.sh` / `lb_wait_*.sh` / `lb_burst_158.py` — 2026-10-27 双机负载均衡真机测试的操作脚本存档（.158/.162 各 boot 一个 1017 副本 → 大屏+网关 → burst → 故障转移）
-- `pull_env_weights_154.sh` / `boot_1017_154.sh` / `bench_154.sh` / `wait_ready_154.sh` / `mm_*_158.*` / `agent_loop_158.sh` / `boot_157_gwtest.sh` — 2026-10-24~26 各轮实测的操作脚本存档
+- `test_lb_v3.py` — 负载均衡本地测试套件（双 mock：策略分流/故障转移/探活/总表，21 项断言）
 
-## 状态（2026-10-27）
+## 状态
 
-- **已发布 GitHub**：https://github.com/xzwgit/ai-dashboard（public；**版本重排后 tag = v1.0.0 / v2.0.0 两个**；install.sh 选版本安装，raw 被墙自动 API 兜底）
-- 公开仓只放：vllm_dashboard.py / vllm_dashboard_v1.py / install.sh / test_mock_openai.py / test_lb_v3.py / 脱敏 README——**rrun.py（含凭据）、各轮 boot/bench 脚本（含内网 IP）不上仓**，只留工作区
-- .158/.162 真机测试环境 2026-10-27 已清理（引擎/大屏全停，双机 GPU 0，dash_ops 留脚本+日志）
+- 主仓：github.com/xzwgit/ai-dashboard（tag v1.0.0 / v2.0.0 / v2.1.0 / v2.1.1）
+- Rust 版（`rs/`）：监控内核已就绪（单二进制），网关侧开发中
 
 ## 版本记录
 | 版本 | 日期 | 内容 |
@@ -124,4 +120,3 @@ python vllm_dashboard.py --demo
 - 计数器重启（引擎重启）自动识别，速率不回负
 - 抓取失败按原因分类报人话：连接被拒=vLLM 未启动/端口不对（Linux Errno 111 / Windows 10061 都认）；HTTP 401/403=鉴权失败提示填 Key；404=路径不对；超时/域名解析错误各自提示；均附原始错误摘要
 - 页面隐藏时暂停轮询，回来即恢复；时间范围 5m/15m/1h/全部
-- 远程机落地的脚本/日志都在 `/root/dash_ops/`（工作区规约）
